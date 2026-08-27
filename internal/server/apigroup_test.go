@@ -357,6 +357,57 @@ func TestServer_APIHardwareUnavailable(t *testing.T) {
 	}
 }
 
+func TestServer_APIResidency(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{
+			"zeta":  {Memory: 3 << 30},
+			"alpha": {Memory: 2 << 30},
+		},
+		Routing: config.RoutingConfig{Router: config.RouterConfig{
+			Use: "auto",
+			Settings: config.RouterSettings{Auto: &config.AutoRouterConfig{
+				Capacity: 8 << 30,
+				Reserve:  1 << 30,
+			}},
+		}},
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/residency", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	var got struct {
+		Configured struct {
+			AutoRouter struct {
+				Enabled             bool   `json:"enabled"`
+				CapacityBytes       uint64 `json:"capacity_bytes"`
+				ReserveBytes        uint64 `json:"reserve_bytes"`
+				UsableCapacityBytes uint64 `json:"usable_capacity_bytes"`
+			} `json:"auto_router"`
+			ModelReservations []struct {
+				Model string `json:"model"`
+				Bytes uint64 `json:"bytes"`
+			} `json:"model_reservations"`
+		} `json:"configured"`
+		LiveUsage map[string]string `json:"live_usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Configured.AutoRouter.Enabled || got.Configured.AutoRouter.CapacityBytes != 8<<30 || got.Configured.AutoRouter.ReserveBytes != 1<<30 || got.Configured.AutoRouter.UsableCapacityBytes != 7<<30 {
+		t.Errorf("auto router = %+v", got.Configured.AutoRouter)
+	}
+	if len(got.Configured.ModelReservations) != 2 || got.Configured.ModelReservations[0].Model != "alpha" || got.Configured.ModelReservations[0].Bytes != 2<<30 || got.Configured.ModelReservations[1].Model != "zeta" || got.Configured.ModelReservations[1].Bytes != 3<<30 {
+		t.Errorf("model reservations = %+v", got.Configured.ModelReservations)
+	}
+	if got.LiveUsage["source"] == "" {
+		t.Error("live usage source is empty")
+	}
+}
+
 func TestServer_APIMetricsActivity_Empty(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 

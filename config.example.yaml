@@ -150,7 +150,8 @@ macros:
 
 # apiKeys: require an API key when making requests to inference endpoints
 # - optional, default: []
-# - when empty (the default) authorization will not be checked as llama-swap is default-allow
+# - when adminApiKeys is empty, these keys also protect administration for
+#   backwards compatibility
 # - each key is a non-empty string
 apiKeys:
   - "sk-hunter2"
@@ -160,6 +161,15 @@ apiKeys:
   # use environment variable macros to keep secrets out of the config
   - "${env.API_KEY_1}"
   - "${env.API_KEY_2}"
+
+# adminApiKeys: separately protect operational endpoints (the UI, logs,
+# metrics, profiles, unload, and upstream/ComfyUI passthrough)
+# - optional, default: []
+# - admin keys also work for inference endpoints
+# - set this while leaving apiKeys empty to allow inference on a trusted LAN
+#   without exposing administration
+adminApiKeys:
+  - "${env.ADMIN_API_KEY}"
 
 # upstream: controls behaviour of the /upstream passthrough endpoint
 # - optional, default: empty dictionary
@@ -519,11 +529,20 @@ routing:
   router:
     # use: a string defining which engine to use
     # - optional, default: "group"
-    # - valid values: group, matrix
+    # - valid values: group, matrix, auto
     use: group
 
     # settings: a dictionary of settings for the specific engines
     settings:
+      # auto: fixed memory budget for the automatic eviction router.
+      # Every local model then needs a conservative `memory` reservation, for
+      # example `memory: 28GiB` under that model's configuration. This option
+      # is documented here for a future auto-router setup; group is active in
+      # this example.
+      # auto:
+      #   capacity: 96GiB
+      #   reserve: 8GiB
+
       # groups: a dictionary of named groups
       # - optional, default: empty dictionary
       # - lets you keep some models loaded while others swap out

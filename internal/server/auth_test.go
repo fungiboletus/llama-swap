@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 )
 
@@ -114,4 +115,49 @@ func TestServer_AuthMiddleware(t *testing.T) {
 			t.Error("missing WWW-Authenticate header")
 		}
 	})
+}
+
+func TestServer_AuthMiddleware_AdminAndInferencePolicy(t *testing.T) {
+	final := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	requestWithKey := func(key string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Authorization", "Bearer "+key)
+		return r
+	}
+
+	cfg := config.Config{
+		RequiredAPIKeys: []string{"inference-key"},
+		AdminAPIKeys:    []string{"admin-key"},
+	}
+	for _, tt := range []struct {
+		name string
+		mw   chain.Middleware
+		key  string
+		want int
+	}{
+		{"inference key reaches inference", CreateInferenceAuthMiddleware(cfg), "inference-key", http.StatusOK},
+		{"admin key reaches inference", CreateInferenceAuthMiddleware(cfg), "admin-key", http.StatusOK},
+		{"inference key cannot administer", CreateAdminAuthMiddleware(cfg), "inference-key", http.StatusUnauthorized},
+		{"admin key can administer", CreateAdminAuthMiddleware(cfg), "admin-key", http.StatusOK},
+		{"legacy api key administers", CreateAdminAuthMiddleware(config.Config{RequiredAPIKeys: []string{"legacy"}}), "legacy", http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			tt.mw(final).ServeHTTP(w, requestWithKey(tt.key))
+			if w.Code != tt.want {
+				t.Errorf("status = %d, want %d", w.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestServer_MatchesAPIKey(t *testing.T) {
+	if !matchesAPIKey("expected", []string{"wrong", "expected"}) {
+		t.Fatal("expected matching key to be accepted")
+	}
+	if matchesAPIKey("expected", []string{"unexpected"}) {
+		t.Fatal("unexpected key was accepted")
+	}
 }

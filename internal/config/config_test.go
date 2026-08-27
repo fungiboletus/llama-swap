@@ -872,6 +872,23 @@ func TestConfig_APIKeys_Invalid(t *testing.T) {
 	}
 }
 
+func TestConfig_AdminAPIKeys(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+apiKeys: [inference-key]
+adminApiKeys: [admin-key]
+`))
+	if err != nil {
+		t.Fatalf("LoadConfigFromReader: %v", err)
+	}
+	assert.Equal(t, []string{"inference-key"}, cfg.RequiredAPIKeys)
+	assert.Equal(t, []string{"admin-key"}, cfg.AdminAPIKeys)
+
+	_, err = LoadConfigFromReader(strings.NewReader(`adminApiKeys: ["bad key"]`))
+	if assert.Error(t, err) {
+		assert.Equal(t, "adminApiKeys[0]: api key cannot contain spaces", err.Error())
+	}
+}
+
 func TestConfig_APIKeys_EnvMacros(t *testing.T) {
 	t.Run("env substitution in apiKeys", func(t *testing.T) {
 		t.Setenv("TEST_API_KEY", "secret-key-123")
@@ -1856,4 +1873,100 @@ routing:
 	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
 	require.NoError(t, err)
 	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
+}
+
+func TestConfig_AutoRouterMemoryValidation(t *testing.T) {
+	valid := `
+models:
+  small:
+    cmd: model-small --port ${PORT}
+    memory: 2GiB
+  large:
+    cmd: model-large --port ${PORT}
+    memory: 6GiB
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 10GiB
+        reserve: 2GiB
+`
+
+	cfg, err := LoadConfigFromReader(strings.NewReader(valid))
+	require.NoError(t, err)
+	assert.Equal(t, "auto", cfg.Routing.Router.Use)
+	require.NotNil(t, cfg.Routing.Router.Settings.Auto)
+	assert.Equal(t, ByteSize(10<<30), cfg.Routing.Router.Settings.Auto.Capacity)
+	assert.Equal(t, ByteSize(2<<30), cfg.Models["small"].Memory)
+	assert.Empty(t, cfg.Groups)
+
+	for _, tt := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"missing settings", `
+models:
+  model:
+    cmd: model --port ${PORT}
+routing:
+  router:
+    use: auto
+`, "settings.auto is not set"},
+		{"zero capacity", `
+models:
+  model:
+    cmd: model --port ${PORT}
+    memory: 1GiB
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 0B
+`, "capacity must be greater than zero"},
+		{"reserve consumes capacity", `
+models:
+  model:
+    cmd: model --port ${PORT}
+    memory: 1GiB
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 1GiB
+        reserve: 1GiB
+`, "reserve must be smaller than capacity"},
+		{"missing model memory", `
+models:
+  model:
+    cmd: model --port ${PORT}
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 2GiB
+`, "memory is required"},
+		{"model does not fit", `
+models:
+  model:
+    cmd: model --port ${PORT}
+    memory: 3GiB
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 3GiB
+        reserve: 1GiB`, "exceeds usable auto-router capacity"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadConfigFromReader(strings.NewReader(tt.yaml))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
 }

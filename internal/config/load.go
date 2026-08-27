@@ -191,7 +191,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// either style, never both.
 	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0
 	rtr := config.Routing.Router
-	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0
+	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0 || rtr.Settings.Auto != nil
 
 	if hasTopLevel && hasRouting {
 		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
@@ -209,8 +209,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			config.Matrix = rs.Matrix
 		case "group", "":
 			config.Groups = rs.Groups
+		case "auto":
+			if rs.Auto == nil {
+				return Config{}, fmt.Errorf("routing.router.use is 'auto' but routing.router.settings.auto is not set")
+			}
 		default:
-			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix)", config.Routing.Router.Use)
+			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, auto)", config.Routing.Router.Use)
 		}
 	}
 
@@ -223,7 +227,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if err := ValidateMatrix(config.Matrix, config.Models); err != nil {
 			return Config{}, fmt.Errorf("matrix: %w", err)
 		}
-	} else {
+	} else if config.Routing.Router.Use != "auto" {
 		config = AddDefaultGroupToConfig(config)
 
 		// Validate group members
@@ -247,7 +251,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// Build the canonical Config.Routing from the effective result. Both legacy
 	// and new-style configs converge here. The Matrix pointer is shared so the
 	// compiled matrix program stays in one place.
-	if config.Matrix != nil {
+	if config.Routing.Router.Use == "auto" {
+		if err := validateAutoRouterConfig(config); err != nil {
+			return Config{}, err
+		}
+	} else if config.Matrix != nil {
 		config.Routing.Router.Use = "matrix"
 	} else {
 		config.Routing.Router.Use = "group"
@@ -282,15 +290,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		config.Hooks.OnStartup.Preload = toPreload
 	}
 
-	// Validate API keys (env macros already substituted at string level)
-	for i, apikey := range config.RequiredAPIKeys {
-		if apikey == "" {
-			return Config{}, fmt.Errorf("empty api key found in apiKeys")
-		}
-		if strings.Contains(apikey, " ") {
-			return Config{}, fmt.Errorf("apiKeys[%d]: api key cannot contain spaces", i)
-		}
-		config.RequiredAPIKeys[i] = apikey
+	// Validate API keys (env macros already substituted at string level).
+	if err := validateAPIKeys("apiKeys", config.RequiredAPIKeys); err != nil {
+		return Config{}, err
+	}
+	if err := validateAPIKeys("adminApiKeys", config.AdminAPIKeys); err != nil {
+		return Config{}, err
 	}
 
 	if err := ValidatePeerNamespace(config); err != nil {
@@ -306,6 +311,48 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	return config, nil
+}
+
+func validateAutoRouterConfig(config Config) error {
+	auto := config.Routing.Router.Settings.Auto
+	if auto == nil {
+		return fmt.Errorf("routing.router.use is 'auto' but routing.router.settings.auto is not set")
+	}
+	if auto.Capacity == 0 {
+		return fmt.Errorf("routing.router.settings.auto.capacity must be greater than zero")
+	}
+	if auto.Reserve >= auto.Capacity {
+		return fmt.Errorf("routing.router.settings.auto.reserve must be smaller than capacity")
+	}
+
+	usable := auto.Capacity - auto.Reserve
+	modelIDs := make([]string, 0, len(config.Models))
+	for modelID := range config.Models {
+		modelIDs = append(modelIDs, modelID)
+	}
+	sort.Strings(modelIDs)
+	for _, modelID := range modelIDs {
+		memory := config.Models[modelID].Memory
+		if memory == 0 {
+			return fmt.Errorf("model %s: memory is required when routing.router.use is 'auto'", modelID)
+		}
+		if memory > usable {
+			return fmt.Errorf("model %s: memory reservation exceeds usable auto-router capacity", modelID)
+		}
+	}
+	return nil
+}
+
+func validateAPIKeys(field string, keys []string) error {
+	for i, apikey := range keys {
+		if apikey == "" {
+			return fmt.Errorf("empty api key found in %s", field)
+		}
+		if strings.Contains(apikey, " ") {
+			return fmt.Errorf("%s[%d]: api key cannot contain spaces", field, i)
+		}
+	}
+	return nil
 }
 
 func validateProfiles(config Config) error {

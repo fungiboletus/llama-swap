@@ -130,6 +130,52 @@ var modelGetRoutes = []string{
 	"/props",
 }
 
+// routeAccess determines which key set, if any, a route requires. Keeping this
+// classification next to route registration makes a newly added endpoint fail
+// fast during startup until its access policy is explicitly chosen.
+type routeAccess uint8
+
+const (
+	routePublic routeAccess = iota
+	routeInference
+	routeAdmin
+)
+
+func routeAccessForPattern(pattern string) (routeAccess, bool) {
+	for _, path := range modelPostJSONRoutes {
+		if pattern == "POST "+path {
+			return routeInference, true
+		}
+	}
+	for _, path := range modelPostFormRoutes {
+		if pattern == "POST "+path {
+			return routeInference, true
+		}
+	}
+	for _, path := range modelGetRoutes {
+		if pattern == "GET "+path {
+			return routeInference, true
+		}
+	}
+
+	switch pattern {
+	case "GET /v1/models", "GET /models", "GET /health", "GET /wol-health", "GET /{$}":
+		return routeInference, true
+	case "GET /favicon.ico":
+		return routePublic, true
+	case "GET /logs", "GET /logs/stream", "GET /logs/stream/{logMonitorID...}",
+		"GET /ui/", "GET /metrics", "GET /unload", "GET /running", "GET /upstream",
+		"/upstream/{upstreamPath...}", "/comfyui", "/comfyui/{comfyPath...}",
+		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
+		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
+		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
+		"GET /api/version", "GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}":
+		return routeAdmin, true
+	default:
+		return routePublic, false
+	}
+}
+
 // isMetricsRecordPath reports whether path is one of the model-dispatched
 // endpoints that the metrics middleware records in the activity log.
 func isMetricsRecordPath(path string) bool {
@@ -168,6 +214,12 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		if err != nil {
 			return nil, fmt.Errorf("creating matrix router: %w", err)
 		}
+	case "auto":
+		// The configuration and observability contract are defined before the
+		// automatic swapper itself. Never silently fall back to group routing:
+		// that would make a valid memory-budget configuration behave differently
+		// from what its operator selected.
+		return nil, fmt.Errorf("routing.router.use 'auto' is not available yet")
 	default: // "group"
 		local, err = router.NewGroup(cfg, proxylog, upstreamlog)
 		if err != nil {
@@ -202,6 +254,9 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		shutdownFn:  shutdownFn,
 	}
 	s.routes()
+	if len(cfg.RequiredAPIKeys) == 0 && len(cfg.AdminAPIKeys) == 0 && proxylog != nil {
+		proxylog.Warnf("no apiKeys or adminApiKeys configured; inference and administration are open")
+	}
 	s.startPreload()
 	return s, nil
 }
@@ -250,10 +305,9 @@ func stripAudioAPIPrefix(r *http.Request) {
 // routes builds the mux, registers every route, and wraps the mux with the
 // global CORS middleware.
 func (s *Server) routes() {
-
-	authMW := CreateAuthMiddleware(s.cfg)
+	inferenceAuthMW := CreateInferenceAuthMiddleware(s.cfg)
+	adminAuthMW := CreateAdminAuthMiddleware(s.cfg)
 	modelChain := chain.New(
-		authMW,
 		CreateProfileMiddleware(s),
 		CreateSelectorMiddleware(s),
 		CreateRequestContextMiddleware(s.cfg),
@@ -262,73 +316,85 @@ func (s *Server) routes() {
 		CreateFormFilterMiddleware(s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
-	// Custom endpoints only need auth.
-	apiChain := chain.New(authMW)
 
 	mux := http.NewServeMux()
+	register := func(pattern string, handler http.Handler) {
+		access, found := routeAccessForPattern(pattern)
+		if !found {
+			panic("server route has no access classification: " + pattern)
+		}
+		switch access {
+		case routeInference:
+			handler = inferenceAuthMW(handler)
+		case routeAdmin:
+			handler = adminAuthMW(handler)
+		}
+		mux.Handle(pattern, handler)
+	}
 	dispatch := http.HandlerFunc(s.localPeerHandler)
 
 	for _, path := range modelPostJSONRoutes {
-		mux.Handle("POST "+path, modelChain.Then(dispatch))
+		register("POST "+path, modelChain.Then(dispatch))
 	}
 	for _, path := range modelPostFormRoutes {
-		mux.Handle("POST "+path, modelChain.Then(dispatch))
+		register("POST "+path, modelChain.Then(dispatch))
 	}
 	for _, path := range modelGetRoutes {
-		mux.Handle("GET "+path, modelChain.Then(dispatch))
+		register("GET "+path, modelChain.Then(dispatch))
 	}
 
 	// llama-swap API + custom endpoints.
-	mux.Handle("GET /v1/models", apiChain.ThenFunc(s.handleListModels))
-	mux.Handle("GET /models", apiChain.ThenFunc(s.handleListModels))
-	mux.Handle("GET /logs", apiChain.ThenFunc(s.handleLogs))
-	mux.Handle("GET /logs/stream", apiChain.ThenFunc(s.handleLogStream))
-	mux.Handle("GET /logs/stream/{logMonitorID...}", apiChain.ThenFunc(s.handleLogStream))
+	register("GET /v1/models", http.HandlerFunc(s.handleListModels))
+	register("GET /models", http.HandlerFunc(s.handleListModels))
+	register("GET /logs", http.HandlerFunc(s.handleLogs))
+	register("GET /logs/stream", http.HandlerFunc(s.handleLogStream))
+	register("GET /logs/stream/{logMonitorID...}", http.HandlerFunc(s.handleLogStream))
 
-	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("GET /wol-health", handleHealth)
-	mux.HandleFunc("GET /{$}", handleRootRedirect)
+	register("GET /health", http.HandlerFunc(handleHealth))
+	register("GET /wol-health", http.HandlerFunc(handleHealth))
+	register("GET /{$}", http.HandlerFunc(handleRootRedirect))
 
 	// Embedded UI.
-	mux.Handle("GET /ui/", chain.New(authMW).ThenFunc(s.handleUI))
-	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
+	register("GET /ui/", http.HandlerFunc(s.handleUI))
+	register("GET /favicon.ico", http.HandlerFunc(s.handleFavicon))
 
-	// Prometheus metrics (wrapped by apiChain, matches the legacy endpoint).
-	mux.Handle("GET /metrics", apiChain.ThenFunc(s.handleMetrics))
+	// Prometheus metrics are administrative because they expose host activity.
+	register("GET /metrics", http.HandlerFunc(s.handleMetrics))
 
 	// Operations endpoints.
-	mux.Handle("GET /unload", apiChain.ThenFunc(s.handleUnload))
-	mux.Handle("GET /running", apiChain.ThenFunc(s.handleRunning))
+	register("GET /unload", http.HandlerFunc(s.handleUnload))
+	register("GET /running", http.HandlerFunc(s.handleRunning))
 
 	// Upstream passthrough. Meter only the model-dispatched endpoints that can
 	// produce token usage/timings.
-	upstreamChain := apiChain.Append(
+	upstreamChain := chain.New(
 		CreateProfileMiddleware(s),
 		CreateUpstreamInflightMiddleware(s.inflight, s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
-	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
-	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
+	register("GET /upstream", http.HandlerFunc(handleUpstreamRedirect))
+	register("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
 
 	// ComfyUI compatibility passthrough. This uses the fixed comfyui_auto model,
 	// whose compatibility settings are applied while loading config. Only the
 	// root path may start an unloaded model.
-	mux.Handle("/comfyui", apiChain.ThenFunc(handleComfyUIRedirect))
-	mux.Handle("/comfyui/{comfyPath...}", apiChain.ThenFunc(s.handleComfyUI))
+	register("/comfyui", http.HandlerFunc(handleComfyUIRedirect))
+	register("/comfyui/{comfyPath...}", http.HandlerFunc(s.handleComfyUI))
 
-	// API group (API-key protected) consumed by the UI.
-	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
-	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
-	mux.Handle("GET /api/profiles", apiChain.ThenFunc(s.handleAPIProfiles))
-	mux.Handle("PUT /api/profiles/active", apiChain.ThenFunc(s.handleAPIActiveProfile))
-	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
-	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
-	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
-	mux.Handle("GET /api/metrics/stats", apiChain.ThenFunc(s.handleAPIActivityStats))
-	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
-	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
-	mux.Handle("GET /api/hardware", apiChain.ThenFunc(s.handleAPIHardware))
-	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
+	// API group consumed by the administrative UI.
+	register("POST /api/models/unload", http.HandlerFunc(s.handleAPIUnloadAll))
+	register("POST /api/models/unload/{model...}", http.HandlerFunc(s.handleAPIUnloadModel))
+	register("GET /api/profiles", http.HandlerFunc(s.handleAPIProfiles))
+	register("PUT /api/profiles/active", http.HandlerFunc(s.handleAPIActiveProfile))
+	register("POST /api/inflight/{id}/cancel", http.HandlerFunc(s.handleAPICancelInflight))
+	register("GET /api/events", http.HandlerFunc(s.handleAPIEvents))
+	register("GET /api/metrics/activity", http.HandlerFunc(s.handleAPIActivity))
+	register("GET /api/metrics/stats", http.HandlerFunc(s.handleAPIActivityStats))
+	register("GET /api/performance", http.HandlerFunc(s.handleAPIPerformance))
+	register("GET /api/version", http.HandlerFunc(s.handleAPIVersion))
+	register("GET /api/hardware", http.HandlerFunc(s.handleAPIHardware))
+	register("GET /api/residency", http.HandlerFunc(s.handleAPIResidency))
+	register("GET /api/captures/{id}", http.HandlerFunc(s.handleAPICapture))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)

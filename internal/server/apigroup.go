@@ -370,6 +370,57 @@ func (s *Server) handleAPIHardware(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleAPIResidency reports the operator-configured inputs to the auto
+// router. Reservations are intentionally separate from /api/performance,
+// whose CPU/GPU values are host-wide aggregate telemetry.
+func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
+	type modelReservation struct {
+		Model string `json:"model"`
+		Bytes uint64 `json:"bytes"`
+	}
+	type autoRouter struct {
+		Enabled             bool   `json:"enabled"`
+		CapacityBytes       uint64 `json:"capacity_bytes"`
+		ReserveBytes        uint64 `json:"reserve_bytes"`
+		UsableCapacityBytes uint64 `json:"usable_capacity_bytes"`
+	}
+
+	modelIDs := make([]string, 0, len(s.cfg.Models))
+	for modelID := range s.cfg.Models {
+		modelIDs = append(modelIDs, modelID)
+	}
+	sort.Strings(modelIDs)
+	reservations := make([]modelReservation, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		reservations = append(reservations, modelReservation{
+			Model: modelID,
+			Bytes: uint64(s.cfg.Models[modelID].Memory),
+		})
+	}
+
+	auto := autoRouter{Enabled: s.cfg.Routing.Router.Use == "auto"}
+	if settings := s.cfg.Routing.Router.Settings.Auto; settings != nil {
+		auto.CapacityBytes = uint64(settings.Capacity)
+		auto.ReserveBytes = uint64(settings.Reserve)
+		if settings.Capacity >= settings.Reserve {
+			auto.UsableCapacityBytes = uint64(settings.Capacity - settings.Reserve)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"configured": map[string]any{
+			"auto_router":        auto,
+			"model_reservations": reservations,
+		},
+		"live_usage": map[string]string{
+			"source": "not attributed per model; see /api/performance for aggregate host telemetry",
+		},
+	}); err != nil {
+		s.proxylog.Warnf("failed to encode residency configuration: %v", err)
+	}
+}
+
 // handleAPICapture returns the stored request/response capture for a metric ID.
 func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))

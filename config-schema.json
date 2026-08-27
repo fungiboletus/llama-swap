@@ -484,6 +484,11 @@
                         "default": -1,
                         "description": "Automatically unload the model after ttl seconds. -1 uses the global TTL value, 0 disables unloading. Must be >0 to enable."
                     },
+                    "memory": {
+                        "type": "string",
+                        "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
+                        "description": "Conservative resident-memory reservation for routing.router.use: auto. Use an unsigned integer with B, KiB, MiB, GiB, or TiB."
+                    },
                     "unloadTimeout": {
                         "type": "integer",
                         "minimum": 0,
@@ -665,7 +670,16 @@
                 "minLength": 1
             },
             "default": [],
-            "description": "Require an API key when making requests to inference endpoints. When empty, authorization will not be checked. Each key is a non-empty string."
+            "description": "Require an API key for inference endpoints. When adminApiKeys is empty, these keys also protect administrative endpoints for backwards compatibility. Each key is a non-empty string."
+        },
+        "adminApiKeys": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": [],
+            "description": "Require an API key for administrative endpoints such as unload, logs, metrics, profiles, and the UI. Admin keys may also access inference endpoints. Leave apiKeys empty to allow unauthenticated inference while protecting administration."
         },
         "peers": {
             "type": "object",
@@ -814,16 +828,17 @@
                 },
                 "router": {
                     "type": "object",
-                    "description": "Router configuration. Selects between the group and matrix swapping strategies.",
+                    "description": "Router configuration. Selects between the group, matrix, and automatic memory-budget swapping strategies.",
                     "properties": {
                         "use": {
                             "type": "string",
                             "enum": [
                                 "group",
-                                "matrix"
+                                "matrix",
+                                "auto"
                             ],
                             "default": "group",
-                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix."
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix, and 'auto' uses configured memory reservations."
                         },
                         "settings": {
                             "type": "object",
@@ -833,6 +848,27 @@
                                 },
                                 "matrix": {
                                     "$ref": "#/definitions/matrixConfig"
+                                },
+                                "auto": {
+                                    "type": "object",
+                                    "description": "Fixed memory budget for the automatic router. Capacity and reserve use explicit IEC byte units.",
+                                    "required": [
+                                        "capacity"
+                                    ],
+                                    "properties": {
+                                        "capacity": {
+                                            "type": "string",
+                                            "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
+                                            "description": "Total memory capacity available to the auto router."
+                                        },
+                                        "reserve": {
+                                            "type": "string",
+                                            "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
+                                            "default": "0B",
+                                            "description": "Memory left unallocated for the host and runtime."
+                                        }
+                                    },
+                                    "additionalProperties": false
                                 }
                             },
                             "additionalProperties": false

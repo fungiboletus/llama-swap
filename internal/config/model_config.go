@@ -87,6 +87,10 @@ type ModelConfig struct {
 	Unlisted      bool     `yaml:"unlisted"`
 	UseModelName  string   `yaml:"useModelName"`
 
+	// Memory is the conservative resident footprint used by the auto router.
+	// It is an operator-provided reservation, not live process telemetry.
+	Memory ByteSize `yaml:"memory"`
+
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`

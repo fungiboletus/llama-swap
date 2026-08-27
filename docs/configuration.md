@@ -24,6 +24,67 @@ models:
 
 With this configuration models will be hot swapped and loaded on demand. The special `${PORT}` macro provides a unique port per model which is useful if you want to run multiple models at the same time with the `matrix` feature.
 
+## Access control
+
+Use `apiKeys` to protect inference and `adminApiKeys` to protect operational
+endpoints such as the UI, logs, metrics, profiles, unload, and raw upstream
+passthrough. An admin key can also call inference endpoints. For a shared LAN
+where inference is open but administration is protected:
+
+```yaml
+adminApiKeys:
+  - "${env.LLAMA_SWAP_ADMIN_KEY}"
+```
+
+For compatibility with existing deployments, when `adminApiKeys` is omitted,
+`apiKeys` protects both inference and administration. When both lists are
+empty, llama-swap is open; use that only behind suitable network controls.
+
+When administrative keys are configured, open `/ui/` directly in a browser.
+llama-swap responds with an HTTP Basic-auth challenge, so the browser prompts
+for the key and reuses the resulting credentials for the UI API and event
+stream requests. Enter any username and use the configured admin key as the
+password.
+
+## Automatic residency memory budget
+
+The `auto` router uses explicit, conservative reservations instead of trying
+to infer process memory or GPU placement. Specify each local model's deployed
+resident footprint and the one memory pool it may use:
+
+```yaml
+models:
+  coder:
+    cmd: llama-server --port ${PORT} --model /models/coder.gguf
+    memory: 28GiB
+  chat:
+    cmd: llama-server --port ${PORT} --model /models/chat.gguf
+    memory: 18GiB
+
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 96GiB
+        reserve: 8GiB
+```
+
+Only exact integer values with `B`, `KiB`, `MiB`, `GiB`, or `TiB` are accepted.
+The usable budget is `capacity - reserve`; every configured model must have a
+positive reservation that fits within it. Group and matrix routers do not need
+memory fields.
+
+Choose a reservation by running one model at a time with its production
+command and context settings, then use a conservative peak from its startup
+and runtime logs. Include model weights, KV cache, and backend allocations.
+Leave host, driver, and unrelated-process headroom in `reserve`; do not add
+separate CPU and shared/unified-GPU capacities together.
+
+`GET /api/residency` exposes the configured reservations and budget. They are
+planning inputs, not measured process usage; use `/api/performance` separately
+for aggregate host telemetry.
+
 ## Advanced control with `cmd`
 
 llama-swap is also about customizability. You can use any CLI flag available:

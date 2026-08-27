@@ -179,6 +179,11 @@ type Config struct {
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
+	// AdminAPIKeys protects operational and administrative endpoints separately
+	// from inference. When empty, apiKeys retains its legacy role of protecting
+	// every protected endpoint.
+	AdminAPIKeys []string `yaml:"adminApiKeys"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 
@@ -206,13 +211,21 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "auto"
 	Settings RouterSettings `yaml:"settings"`
 }
 
 type RouterSettings struct {
 	Groups map[string]GroupConfig `yaml:"groups"`
 	Matrix *MatrixConfig          `yaml:"matrix"`
+	Auto   *AutoRouterConfig      `yaml:"auto"`
+}
+
+// AutoRouterConfig specifies the fixed memory pool used by the auto router.
+// Capacity is the whole pool and Reserve is left unused for the host/runtime.
+type AutoRouterConfig struct {
+	Capacity ByteSize `yaml:"capacity"`
+	Reserve  ByteSize `yaml:"reserve"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {

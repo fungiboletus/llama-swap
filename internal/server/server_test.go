@@ -92,6 +92,13 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	return s
 }
 
+func newAuthTestServer(cfg config.Config) *Server {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = cfg
+	s.routes()
+	return s
+}
+
 func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	t.Helper()
 	st, err := store.New("")
@@ -130,6 +137,104 @@ func audioTaskRequest(model string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/audioapi/v1/tasks/run", body)
 	req.Header.Set("Content-Type", "application/json")
 	return req
+}
+
+func TestServer_RouteAccessPolicy(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    routeAccess
+	}{
+		{"POST /v1/chat/completions", routeInference},
+		{"GET /v1/models", routeInference},
+		{"GET /health", routeInference},
+		{"GET /logs", routeAdmin},
+		{"/upstream/{upstreamPath...}", routeAdmin},
+		{"/comfyui/{comfyPath...}", routeAdmin},
+		{"POST /api/models/unload", routeAdmin},
+		{"GET /api/hardware", routeAdmin},
+		{"GET /api/residency", routeAdmin},
+		{"GET /favicon.ico", routePublic},
+	}
+	for _, tt := range cases {
+		t.Run(tt.pattern, func(t *testing.T) {
+			got, found := routeAccessForPattern(tt.pattern)
+			if !found || got != tt.want {
+				t.Errorf("routeAccessForPattern(%q) = (%v, %v), want (%v, true)", tt.pattern, got, found, tt.want)
+			}
+		})
+	}
+}
+
+func TestServer_RouteAuthorization(t *testing.T) {
+	request := func(path, key string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		if key != "" {
+			r.Header.Set("Authorization", "Bearer "+key)
+		}
+		return r
+	}
+
+	t.Run("admin key without inference key", func(t *testing.T) {
+		s := newAuthTestServer(config.Config{AdminAPIKeys: []string{"admin"}})
+		for _, tt := range []struct {
+			path string
+			key  string
+			want int
+		}{
+			{"/v1/models", "", http.StatusOK},
+			{"/api/version", "", http.StatusUnauthorized},
+			{"/api/version", "admin", http.StatusOK},
+		} {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, request(tt.path, tt.key))
+			if w.Code != tt.want {
+				t.Errorf("%s with %q: status = %d, want %d", tt.path, tt.key, w.Code, tt.want)
+			}
+		}
+	})
+
+	t.Run("separate inference and admin keys", func(t *testing.T) {
+		s := newAuthTestServer(config.Config{
+			RequiredAPIKeys: []string{"inference"},
+			AdminAPIKeys:    []string{"admin"},
+		})
+		for _, tt := range []struct {
+			path string
+			key  string
+			want int
+		}{
+			{"/v1/models", "inference", http.StatusOK},
+			{"/api/version", "inference", http.StatusUnauthorized},
+			{"/v1/models", "admin", http.StatusOK},
+			{"/api/version", "admin", http.StatusOK},
+		} {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, request(tt.path, tt.key))
+			if w.Code != tt.want {
+				t.Errorf("%s with %q: status = %d, want %d", tt.path, tt.key, w.Code, tt.want)
+			}
+		}
+	})
+
+	t.Run("legacy inference keys protect administration", func(t *testing.T) {
+		s := newAuthTestServer(config.Config{RequiredAPIKeys: []string{"legacy"}})
+		for _, tt := range []struct {
+			path string
+			key  string
+			want int
+		}{
+			{"/v1/models", "", http.StatusUnauthorized},
+			{"/api/version", "", http.StatusUnauthorized},
+			{"/v1/models", "legacy", http.StatusOK},
+			{"/api/version", "legacy", http.StatusOK},
+		} {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, request(tt.path, tt.key))
+			if w.Code != tt.want {
+				t.Errorf("%s with %q: status = %d, want %d", tt.path, tt.key, w.Code, tt.want)
+			}
+		}
+	})
 }
 
 func TestServer_New_GroupConfig(t *testing.T) {
@@ -180,6 +285,16 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	}
 	if err := s.Shutdown(time.Second); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestServer_New_AutoRouterIsRejectedUntilImplemented(t *testing.T) {
+	cfg := config.Config{
+		Routing: config.RoutingConfig{Router: config.RouterConfig{Use: "auto"}},
+	}
+	_, err := New(cfg, nil, nil, nil, nil, nil, BuildInfo{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not available yet") {
+		t.Fatalf("New() error = %v, want auto router unavailable", err)
 	}
 }
 
