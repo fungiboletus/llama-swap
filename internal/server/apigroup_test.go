@@ -316,6 +316,26 @@ func TestServer_APIVersion(t *testing.T) {
 	}
 }
 
+func TestOllamaCompatibleVersion(t *testing.T) {
+	for _, tt := range []struct {
+		build string
+		want  string
+	}{
+		{build: "v251", want: "251.0.0"},
+		{build: "v1.2.3", want: "1.2.3"},
+		{build: "v251-9-gf76452e", want: "251.0.0-dev.9+gf76452e"},
+		{build: "v1.2.3-rc.1-9-gf76452e", want: "1.2.3-rc.1.9+gf76452e"},
+		{build: "0.0.0-dev", want: "0.0.0-dev"},
+		{build: "devel", want: "0.0.0-dev"},
+	} {
+		t.Run(tt.build, func(t *testing.T) {
+			if got := ollamaCompatibleVersion(tt.build); got != tt.want {
+				t.Errorf("ollamaCompatibleVersion(%q) = %q, want %q", tt.build, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestServer_APIHardware(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.hardware = &hw.HardwareSnapshot{

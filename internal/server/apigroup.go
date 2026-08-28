@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
+
+var gitDescribeVersion = regexp.MustCompile(`^(.*)-([0-9]+)-g([0-9a-fA-F]+)$`)
 
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
@@ -349,14 +352,102 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAPIVersion serves the build metadata.
+// handleAPIVersion serves build metadata. Its version field is SemVer so it is
+// accepted by Ollama clients while still retaining the gateway commit/date.
 func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"version":    s.build.Version,
+		"version":    ollamaCompatibleVersion(s.build.Version),
 		"commit":     s.build.Commit,
 		"build_date": s.build.Date,
 	})
+}
+
+// ollamaCompatibleVersion maps the gateway's Git tag or git-describe build
+// string to SemVer. No Ollama release is claimed: a development build remains
+// visibly pre-release and includes its source revision as build metadata.
+func ollamaCompatibleVersion(buildVersion string) string {
+	tag := strings.TrimPrefix(strings.TrimSpace(buildVersion), "v")
+	distance := ""
+	hash := ""
+	if matches := gitDescribeVersion.FindStringSubmatch(tag); matches != nil {
+		tag = matches[1]
+		distance = matches[2]
+		hash = matches[3]
+	}
+
+	core, prerelease, ok := normalizeSemverTag(tag)
+	if !ok {
+		return "0.0.0-dev"
+	}
+	if distance == "" {
+		return core + prerelease
+	}
+	if prerelease == "" {
+		prerelease = "-dev"
+	}
+	return core + prerelease + "." + distance + "+g" + hash
+}
+
+func normalizeSemverTag(tag string) (string, string, bool) {
+	core := tag
+	prerelease := ""
+	if index := strings.IndexByte(tag, '-'); index >= 0 {
+		core, prerelease = tag[:index], tag[index:]
+		if !validSemverIdentifiers(prerelease[1:], true) {
+			return "", "", false
+		}
+	}
+
+	parts := strings.Split(core, ".")
+	if len(parts) == 0 || len(parts) > 3 {
+		return "", "", false
+	}
+	for _, part := range parts {
+		if !validSemverNumber(part) {
+			return "", "", false
+		}
+	}
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+	return strings.Join(parts, "."), prerelease, true
+}
+
+func validSemverIdentifiers(value string, rejectLeadingZeroNumbers bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for _, char := range identifier {
+			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-') {
+				return false
+			}
+			if char < '0' || char > '9' {
+				numeric = false
+			}
+		}
+		if rejectLeadingZeroNumbers && numeric && !validSemverNumber(identifier) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSemverNumber(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // handleAPIHardware serves the hardware snapshot captured at process startup.
