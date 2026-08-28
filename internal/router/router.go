@@ -54,3 +54,16 @@ type LocalRouter interface {
 	// model is not known to this router.
 	ProcessLogger(modelID string) (*logmon.Monitor, bool)
 }
+
+// ResidencyInfo describes the reservation currently used by a residency-aware
+// router. Source is either "configured", "calibrated", or "unprofiled".
+type ResidencyInfo struct {
+	Bytes  uint64
+	Source string
+}
+
+// ResidencyReporter is optionally implemented by routers that can explain the
+// memory numbers used for admission decisions.
+type ResidencyReporter interface {
+	ResidencyInfo() map[string]ResidencyInfo
+}

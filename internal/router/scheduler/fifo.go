@@ -187,6 +187,9 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 // that no longer collide with the remaining active set. FIFO order is preserved:
 // items still blocked stay in place.
 func (s *FIFO) OnSwapDone(ev SwapDone) {
+	if observer, ok := s.planner.(SwapDoneObserver); ok {
+		observer.OnSwapDone(ev)
+	}
 	sw, ok := s.active[ev.ModelID]
 	if !ok {
 		return
@@ -208,6 +211,9 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 // zero, retries the queue: requests whose swap was deferred because they would
 // have evicted this (now-idle) process can now proceed.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
+	if observer, ok := s.planner.(ServeDoneObserver); ok {
+		observer.OnServeDone(ev.ModelID)
+	}
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
 	if s.inFlight[ev.ModelID] <= 0 {

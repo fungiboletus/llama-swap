@@ -46,6 +46,40 @@ for the key and reuses the resulting credentials for the UI API and event
 stream requests. Enter any username and use the configured admin key as the
 password.
 
+## Ollama model sources
+
+`ollama` enables managed local Ollama lanes. This is designed for Apple unified
+memory: llama-swap, rather than Ollama's global scheduler, owns cross-model
+admission and eviction. At startup llama-swap briefly starts a private Ollama
+server to read the installed catalogue. It then makes each discovered model a
+normal `auto`-router member and starts one `ollama serve` process for that
+model only when it is admitted. Restart llama-swap after pulling or removing a
+model so it can refresh that fixed runtime catalogue.
+
+```yaml
+ollama:
+  command: ollama
+  startPort: 11450
+  contextLength: 32768 # optional; 0 keeps each model's Ollama default
+  numParallel: 1
+  # optional on Apple: first load is calibrated and persisted
+  memory: 24GiB
+
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 96GiB
+        reserve: 8GiB
+```
+
+Each lane gets a distinct localhost port, `OLLAMA_MAX_LOADED_MODELS=1`, and an
+infinite Ollama keep-alive. `numParallel` becomes the per-model request-
+concurrency limit and affects the model's actual memory use, so choose it
+conservatively.
+The isolated lane-port range must not overlap another local service.
+
 ## Automatic residency memory budget
 
 The `auto` router uses explicit, conservative reservations instead of trying
@@ -71,9 +105,10 @@ routing:
 ```
 
 Only exact integer values with `B`, `KiB`, `MiB`, `GiB`, or `TiB` are accepted.
-The usable budget is `capacity - reserve`; every configured model must have a
-positive reservation that fits within it. Group and matrix routers do not need
-memory fields.
+The usable budget is `capacity - reserve`. A positive `memory` value is an
+authoritative operator override. When it is omitted, the auto router initially
+loads that model by itself and records a conservative observed footprint for
+later starts. Group and matrix routers do not need memory fields.
 
 Choose a reservation by running one model at a time with its production
 command and context settings, then use a conservative peak from its startup
@@ -81,9 +116,23 @@ and runtime logs. Include model weights, KV cache, and backend allocations.
 Leave host, driver, and unrelated-process headroom in `reserve`; do not add
 separate CPU and shared/unified-GPU capacities together.
 
-`GET /api/residency` exposes the configured reservations and budget. They are
-planning inputs, not measured process usage; use `/api/performance` separately
-for aggregate host telemetry.
+`GET /api/residency` exposes the configured or learned reservations and budget.
+Use `/api/performance` separately for aggregate host telemetry.
+
+On Apple Silicon, a model with no `memory` override starts by itself once. The
+auto router records the increase in unified memory at readiness and keeps a
+30-second high-water observation only while that model remains the sole
+managed resident model. It never assigns aggregate growth while models share
+the pool, and it never lowers a learned value. The resulting profile is keyed
+to the deployed command/configuration fingerprint and is persisted in the
+SQLite `store.path`; configure a file-backed store to retain it across restarts.
+`GET /api/residency` labels each reservation as `configured`, `calibrated`, or
+`unprofiled`.
+
+On non-Apple hosts, automatic calibration is unavailable in this release, so
+auto-routing configurations must provide `memory` for every model. This keeps
+NVIDIA and ROCm deployments compatible without pretending an aggregate device
+measurement identifies a particular process.
 
 ## Advanced control with `cmd`
 

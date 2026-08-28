@@ -388,8 +388,9 @@ func TestServer_APIResidency(t *testing.T) {
 				UsableCapacityBytes uint64 `json:"usable_capacity_bytes"`
 			} `json:"auto_router"`
 			ModelReservations []struct {
-				Model string `json:"model"`
-				Bytes uint64 `json:"bytes"`
+				Model  string `json:"model"`
+				Bytes  uint64 `json:"bytes"`
+				Source string `json:"source"`
 			} `json:"model_reservations"`
 		} `json:"configured"`
 		LiveUsage map[string]string `json:"live_usage"`
@@ -400,7 +401,7 @@ func TestServer_APIResidency(t *testing.T) {
 	if !got.Configured.AutoRouter.Enabled || got.Configured.AutoRouter.CapacityBytes != 8<<30 || got.Configured.AutoRouter.ReserveBytes != 1<<30 || got.Configured.AutoRouter.UsableCapacityBytes != 7<<30 {
 		t.Errorf("auto router = %+v", got.Configured.AutoRouter)
 	}
-	if len(got.Configured.ModelReservations) != 2 || got.Configured.ModelReservations[0].Model != "alpha" || got.Configured.ModelReservations[0].Bytes != 2<<30 || got.Configured.ModelReservations[1].Model != "zeta" || got.Configured.ModelReservations[1].Bytes != 3<<30 {
+	if len(got.Configured.ModelReservations) != 2 || got.Configured.ModelReservations[0].Model != "alpha" || got.Configured.ModelReservations[0].Bytes != 2<<30 || got.Configured.ModelReservations[0].Source != "configured" || got.Configured.ModelReservations[1].Model != "zeta" || got.Configured.ModelReservations[1].Bytes != 3<<30 || got.Configured.ModelReservations[1].Source != "configured" {
 		t.Errorf("model reservations = %+v", got.Configured.ModelReservations)
 	}
 	if got.LiveUsage["source"] == "" {

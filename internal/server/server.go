@@ -159,7 +159,8 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 	}
 
 	switch pattern {
-	case "GET /v1/models", "GET /models", "GET /health", "GET /wol-health", "GET /{$}":
+	case "GET /v1/models", "GET /models", "GET /health", "GET /wol-health", "GET /{$}", "HEAD /{$}",
+		"GET /api/version", "GET /api/tags", "POST /api/show", "POST /api/chat", "POST /api/generate":
 		return routeInference, true
 	case "GET /favicon.ico":
 		return routePublic, true
@@ -169,7 +170,7 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
 		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
 		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
-		"GET /api/version", "GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}":
+		"GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}":
 		return routeAdmin, true
 	default:
 		return routePublic, false
@@ -205,6 +206,10 @@ type BuildInfo struct {
 }
 
 func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot) (*Server, error) {
+	if err := prepareOllamaModels(context.Background(), &cfg); err != nil {
+		return nil, fmt.Errorf("preparing Ollama models: %w", err)
+	}
+
 	var local router.LocalRouter
 	var err error
 
@@ -215,11 +220,10 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 			return nil, fmt.Errorf("creating matrix router: %w", err)
 		}
 	case "auto":
-		// The configuration and observability contract are defined before the
-		// automatic swapper itself. Never silently fall back to group routing:
-		// that would make a valid memory-budget configuration behave differently
-		// from what its operator selected.
-		return nil, fmt.Errorf("routing.router.use 'auto' is not available yet")
+		local, err = router.NewAuto(cfg, proxylog, upstreamlog, st)
+		if err != nil {
+			return nil, fmt.Errorf("creating auto router: %w", err)
+		}
 	default: // "group"
 		local, err = router.NewGroup(cfg, proxylog, upstreamlog)
 		if err != nil {
@@ -235,7 +239,6 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	if st == nil {
 		return nil, fmt.Errorf("store is required")
 	}
-
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:         cfg,
@@ -353,6 +356,15 @@ func (s *Server) routes() {
 	register("GET /health", http.HandlerFunc(handleHealth))
 	register("GET /wol-health", http.HandlerFunc(handleHealth))
 	register("GET /{$}", http.HandlerFunc(handleRootRedirect))
+	register("HEAD /{$}", http.HandlerFunc(s.handleOllamaRoot))
+
+	// Minimal Ollama compatibility API. These endpoints translate requests before
+	// entering the same local router and memory scheduler.
+	register("GET /api/version", http.HandlerFunc(s.handleAPIVersion))
+	register("GET /api/tags", http.HandlerFunc(s.handleOllamaTags))
+	register("POST /api/show", http.HandlerFunc(s.handleOllamaShow))
+	register("POST /api/chat", http.HandlerFunc(s.handleOllamaChat))
+	register("POST /api/generate", http.HandlerFunc(s.handleOllamaGenerate))
 
 	// Embedded UI.
 	register("GET /ui/", http.HandlerFunc(s.handleUI))
@@ -391,7 +403,6 @@ func (s *Server) routes() {
 	register("GET /api/metrics/activity", http.HandlerFunc(s.handleAPIActivity))
 	register("GET /api/metrics/stats", http.HandlerFunc(s.handleAPIActivityStats))
 	register("GET /api/performance", http.HandlerFunc(s.handleAPIPerformance))
-	register("GET /api/version", http.HandlerFunc(s.handleAPIVersion))
 	register("GET /api/hardware", http.HandlerFunc(s.handleAPIHardware))
 	register("GET /api/residency", http.HandlerFunc(s.handleAPIResidency))
 	register("GET /api/captures/{id}", http.HandlerFunc(s.handleAPICapture))

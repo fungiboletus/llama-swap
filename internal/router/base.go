@@ -37,6 +37,7 @@ type baseRouter struct {
 	processes map[string]process.Process
 	logger    *logmon.Monitor
 	schedule  scheduler.Scheduler
+	planner   scheduler.Swapper
 
 	// shutdownCtx governs the request machinery: cancelling it tells grant()
 	// and ServeHTTP to stop granting and reject callers. It is deliberately
@@ -84,6 +85,7 @@ func newBaseRouter(
 		config:      conf,
 		processes:   processes,
 		logger:      logger,
+		planner:     planner,
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 		procCtx:     procCtx,
@@ -254,6 +256,9 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 		}(b.processes[mID], mID)
 	}
 	wg.Wait()
+	if observer, ok := b.planner.(scheduler.BeforeStartObserver); ok {
+		observer.BeforeStart(modelID)
+	}
 
 	// EnsureReady rather than a State() check followed by Run: the router must
 	// not assume anything about the process. Deciding out here means acting on
@@ -262,6 +267,7 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
+	started := time.Now()
 	err := target.EnsureReady(b.shutdownCtx, timeout)
 	if err != nil && b.shutdownCtx.Err() == nil {
 		// Quiet during shutdown: every in-flight swap fails at once there, and
@@ -270,7 +276,7 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	}
 
 	select {
-	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err}:
+	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err, LoadDuration: time.Since(started)}:
 	case <-b.shutdownCtx.Done():
 	}
 }

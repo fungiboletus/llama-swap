@@ -414,3 +414,36 @@ func TestStore_NewFileUsesWAL(t *testing.T) {
 		t.Fatalf("journal_mode = %q, want wal", mode)
 	}
 }
+
+func TestStore_MemoryProfilePersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "llama-swap.db")
+	st, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	profile := MemoryProfile{
+		ModelID:       "model",
+		Fingerprint:   "deployment-fingerprint",
+		ObservedBytes: 1234,
+		ObservedAt:    time.Unix(42, 0),
+	}
+	if err := st.SaveMemoryProfile(context.Background(), profile); err != nil {
+		t.Fatalf("SaveMemoryProfile: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	st, err = New(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st.Close()
+	got, found, err := st.LoadMemoryProfile(context.Background(), profile.ModelID, profile.Fingerprint)
+	if err != nil {
+		t.Fatalf("LoadMemoryProfile: %v", err)
+	}
+	if !found || got.ObservedBytes != profile.ObservedBytes || !got.ObservedAt.Equal(profile.ObservedAt) {
+		t.Errorf("loaded profile = %+v, found=%v", got, found)
+	}
+}

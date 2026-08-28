@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math"
@@ -125,6 +126,16 @@ type Store struct {
 	inMemory bool
 }
 
+// MemoryProfile is an isolated, conservative memory observation for one
+// deployed model configuration. Fingerprint changes whenever the launcher
+// configuration used to create the observation changes.
+type MemoryProfile struct {
+	ModelID       string
+	Fingerprint   string
+	ObservedBytes uint64
+	ObservedAt    time.Time
+}
+
 // IsInMemory returns true if the store is using an in-memory database.
 func (s *Store) IsInMemory() bool {
 	return s.inMemory
@@ -187,6 +198,55 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+// LoadMemoryProfile returns a profile only when it exactly matches the current
+// model deployment fingerprint.
+func (s *Store) LoadMemoryProfile(ctx context.Context, modelID, fingerprint string) (MemoryProfile, bool, error) {
+	var observedBytes, observedAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT observed_bytes, observed_at
+		FROM memory_profiles
+		WHERE model_id = ? AND fingerprint = ?`, modelID, fingerprint).Scan(&observedBytes, &observedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MemoryProfile{}, false, nil
+	}
+	if err != nil {
+		return MemoryProfile{}, false, fmt.Errorf("load memory profile: %w", err)
+	}
+	if observedBytes < 0 {
+		return MemoryProfile{}, false, fmt.Errorf("load memory profile: invalid negative byte count")
+	}
+	return MemoryProfile{
+		ModelID:       modelID,
+		Fingerprint:   fingerprint,
+		ObservedBytes: uint64(observedBytes),
+		ObservedAt:    time.Unix(observedAt, 0),
+	}, true, nil
+}
+
+// SaveMemoryProfile inserts or updates the profile for a model deployment.
+func (s *Store) SaveMemoryProfile(ctx context.Context, profile MemoryProfile) error {
+	if profile.ModelID == "" || profile.Fingerprint == "" {
+		return errors.New("memory profile model ID and fingerprint are required")
+	}
+	if profile.ObservedBytes > math.MaxInt64 {
+		return errors.New("memory profile byte count exceeds SQLite integer range")
+	}
+	if profile.ObservedAt.IsZero() {
+		profile.ObservedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO memory_profiles (model_id, fingerprint, observed_bytes, observed_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(model_id, fingerprint) DO UPDATE SET
+			observed_bytes = excluded.observed_bytes,
+			observed_at = excluded.observed_at`,
+		profile.ModelID, profile.Fingerprint, int64(profile.ObservedBytes), profile.ObservedAt.Unix())
+	if err != nil {
+		return fmt.Errorf("save memory profile: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (ActivityLogEntry, error) {

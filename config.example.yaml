@@ -187,6 +187,20 @@ upstream:
     # when the UI is open
     - ^\/ws$|^\/api\/jobs$
 
+# ollama: optionally manage every locally installed Ollama model as its own
+# isolated lane. Requires `routing.router.use: auto`. llama-swap discovers the
+# catalogue once at startup; restart after pulling/removing a model.
+#
+# ollama:
+#   command: ollama                # default: ollama
+#   startPort: 11450               # distinct localhost port per discovered model
+#   contextLength: 32768           # optional; 0 retains each model default
+#   numParallel: 1
+#   memory: 24GiB                  # optional on Apple auto routing
+#
+# Each lane is limited to one Ollama runner and kept loaded until llama-swap's
+# auto router evicts it.
+
 # profiles: named model ID replacements switched at runtime through the UI or API
 # - optional, default: empty dictionary
 # - one profile or none is active; startup and configuration reload select none
@@ -537,8 +551,7 @@ routing:
       # auto: fixed memory budget for the automatic eviction router.
       # Every local model then needs a conservative `memory` reservation, for
       # example `memory: 28GiB` under that model's configuration. This option
-      # is documented here for a future auto-router setup; group is active in
-      # this example.
+      # can be used when `use: auto`; group is active in this example.
       # auto:
       #   capacity: 96GiB
       #   reserve: 8GiB

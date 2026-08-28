@@ -13,6 +13,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -375,8 +376,9 @@ func (s *Server) handleAPIHardware(w http.ResponseWriter, r *http.Request) {
 // whose CPU/GPU values are host-wide aggregate telemetry.
 func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
 	type modelReservation struct {
-		Model string `json:"model"`
-		Bytes uint64 `json:"bytes"`
+		Model  string `json:"model"`
+		Bytes  uint64 `json:"bytes"`
+		Source string `json:"source"`
 	}
 	type autoRouter struct {
 		Enabled             bool   `json:"enabled"`
@@ -391,10 +393,22 @@ func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(modelIDs)
 	reservations := make([]modelReservation, 0, len(modelIDs))
+	info := map[string]router.ResidencyInfo(nil)
+	if reporter, ok := s.local.(router.ResidencyReporter); ok {
+		info = reporter.ResidencyInfo()
+	}
 	for _, modelID := range modelIDs {
+		reservation := router.ResidencyInfo{
+			Bytes:  uint64(s.cfg.Models[modelID].Memory),
+			Source: "configured",
+		}
+		if found, ok := info[modelID]; ok {
+			reservation = found
+		}
 		reservations = append(reservations, modelReservation{
-			Model: modelID,
-			Bytes: uint64(s.cfg.Models[modelID].Memory),
+			Model:  modelID,
+			Bytes:  reservation.Bytes,
+			Source: reservation.Source,
 		})
 	}
 

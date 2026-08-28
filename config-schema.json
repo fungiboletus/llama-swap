@@ -487,7 +487,7 @@
                     "memory": {
                         "type": "string",
                         "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
-                        "description": "Conservative resident-memory reservation for routing.router.use: auto. Use an unsigned integer with B, KiB, MiB, GiB, or TiB."
+                        "description": "Optional conservative resident-memory override for routing.router.use: auto. When omitted, auto routing uses a persisted isolated calibration when available. Use an unsigned integer with B, KiB, MiB, GiB, or TiB."
                     },
                     "unloadTimeout": {
                         "type": "integer",
@@ -769,6 +769,44 @@
             },
             "default": {},
             "description": "A dictionary of remote peers and models they provide. Peers can be another llama-swap or any server that provides the /v1/ generative API endpoints supported by llama-swap."
+        },
+        "ollama": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "default": "ollama",
+                    "description": "Ollama executable used for the short-lived catalogue server and each managed model lane."
+                },
+                "startPort": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "default": 11450,
+                    "description": "First localhost port reserved for managed model lanes; discovered model names receive stable ports in lexical order."
+                },
+                "contextLength": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Optional OLLAMA_CONTEXT_LENGTH for every managed lane. Zero leaves Ollama's model default unchanged."
+                },
+                "numParallel": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "OLLAMA_NUM_PARALLEL for each lane and the matching llama-swap request concurrency limit."
+                },
+                "memory": {
+                    "type": "string",
+                    "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
+                    "description": "Optional conservative reservation for every discovered model. Apple auto routing calibrates an omitted value in isolation; other platforms require one."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Discover locally installed models during llama-swap startup and run one managed Ollama server per active model. Requires routing.router.use: auto."
         },
         "upstream": {
             "type": "object",

@@ -189,6 +189,9 @@ type Config struct {
 
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
+
+	// Ollama enables locally managed, isolated Ollama model lanes.
+	Ollama OllamaConfig `yaml:"ollama"`
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.

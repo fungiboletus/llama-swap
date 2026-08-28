@@ -43,6 +43,22 @@ type Swapper interface {
 	OnSwapStart(target string, running []string)
 }
 
+// BeforeStartObserver is implemented by policies that need an observation
+// after evictions complete but before their target starts.
+type BeforeStartObserver interface {
+	BeforeStart(modelID string)
+}
+
+// SwapDoneObserver is implemented by policies that record a successful load.
+type SwapDoneObserver interface {
+	OnSwapDone(SwapDone)
+}
+
+// ServeDoneObserver is implemented by policies that rank models by idle time.
+type ServeDoneObserver interface {
+	OnServeDone(modelID string)
+}
+
 // Scheduler decides what happens to each event the router's run loop receives.
 // All methods run on that single run-loop goroutine, so implementations need no
 // internal locking for their own state.
@@ -126,8 +142,9 @@ type HandlerResp struct {
 
 // SwapDone is reported by a swap goroutine when its target is ready (or failed).
 type SwapDone struct {
-	ModelID string
-	Err     error
+	ModelID      string
+	Err          error
+	LoadDuration time.Duration
 }
 
 // ServeDoneEvent is reported when a tracked ServeHTTP handler returns.

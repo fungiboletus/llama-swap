@@ -147,6 +147,9 @@ func TestServer_RouteAccessPolicy(t *testing.T) {
 		{"POST /v1/chat/completions", routeInference},
 		{"GET /v1/models", routeInference},
 		{"GET /health", routeInference},
+		{"GET /api/version", routeInference},
+		{"GET /api/tags", routeInference},
+		{"POST /api/chat", routeInference},
 		{"GET /logs", routeAdmin},
 		{"/upstream/{upstreamPath...}", routeAdmin},
 		{"/comfyui/{comfyPath...}", routeAdmin},
@@ -182,7 +185,7 @@ func TestServer_RouteAuthorization(t *testing.T) {
 			want int
 		}{
 			{"/v1/models", "", http.StatusOK},
-			{"/api/version", "", http.StatusUnauthorized},
+			{"/api/version", "", http.StatusOK},
 			{"/api/version", "admin", http.StatusOK},
 		} {
 			w := httptest.NewRecorder()
@@ -204,7 +207,7 @@ func TestServer_RouteAuthorization(t *testing.T) {
 			want int
 		}{
 			{"/v1/models", "inference", http.StatusOK},
-			{"/api/version", "inference", http.StatusUnauthorized},
+			{"/api/version", "inference", http.StatusOK},
 			{"/v1/models", "admin", http.StatusOK},
 			{"/api/version", "admin", http.StatusOK},
 		} {
@@ -288,13 +291,28 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	}
 }
 
-func TestServer_New_AutoRouterIsRejectedUntilImplemented(t *testing.T) {
-	cfg := config.Config{
-		Routing: config.RoutingConfig{Router: config.RouterConfig{Use: "auto"}},
+func TestServer_New_AutoConfig(t *testing.T) {
+	discard := logmon.NewWriter(io.Discard)
+	cfg := config.Config{HealthCheckTimeout: 15}
+	cfg.Models = map[string]config.ModelConfig{
+		"model": {Cmd: "echo ready", Proxy: "http://localhost:8080", Memory: 1},
 	}
-	_, err := New(cfg, nil, nil, nil, nil, nil, BuildInfo{}, nil)
-	if err == nil || !strings.Contains(err.Error(), "not available yet") {
-		t.Fatalf("New() error = %v, want auto router unavailable", err)
+	cfg.Routing.Router.Use = "auto"
+	cfg.Routing.Router.Settings.Auto = &config.AutoRouterConfig{Capacity: 2}
+	st, err := store.New("")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	if err != nil {
+		t.Fatalf("New (auto): %v", err)
+	}
+	if _, ok := s.local.(*router.Auto); !ok {
+		t.Fatalf("localRouter=%T want *router.Auto", s.local)
+	}
+	if err := s.Shutdown(time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 }
 

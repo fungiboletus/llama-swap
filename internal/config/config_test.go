@@ -68,6 +68,84 @@ models:
 	assert.Contains(t, err.Error(), "duplicate alias m1 found in model: model")
 }
 
+func TestConfig_OllamaManagedLanes(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+globalTTL: 0
+unloadTimeout: 12
+ollama:
+  command: /opt/local/bin/ollama
+  startPort: 12000
+  contextLength: 32768
+  numParallel: 2
+  memory: 24GiB
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 96GiB
+        reserve: 8GiB
+`))
+	require.NoError(t, err)
+
+	require.True(t, cfg.Ollama.Enabled)
+	require.NoError(t, cfg.AddOllamaModels([]string{"qwen3:8b", "llama3.2:3b", "qwen3:8b"}))
+	require.Len(t, cfg.Models, 2)
+
+	qwen := cfg.Models["qwen3:8b"]
+	assert.Equal(t, `"/opt/local/bin/ollama" serve`, qwen.Cmd)
+	assert.Equal(t, "http://127.0.0.1:12001", qwen.Proxy)
+	assert.Equal(t, "/", qwen.CheckEndpoint)
+	assert.Equal(t, 2, qwen.ConcurrencyLimit)
+	assert.Equal(t, 32768, qwen.Capabilities.Context)
+	assert.Equal(t, ByteSize(24<<30), qwen.Memory)
+	assert.Equal(t, []string{
+		"OLLAMA_HOST=127.0.0.1:12001",
+		"OLLAMA_MAX_LOADED_MODELS=1",
+		"OLLAMA_KEEP_ALIVE=-1",
+		"OLLAMA_NUM_PARALLEL=2",
+		"OLLAMA_CONTEXT_LENGTH=32768",
+	}, qwen.Env)
+}
+
+func TestConfig_OllamaManagedLanesRejectInvalidPlacement(t *testing.T) {
+	t.Run("requires auto router", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+ollama:
+  command: ollama
+`))
+		require.ErrorContains(t, err, "requires routing.router.use: auto")
+	})
+
+	t.Run("rejects local name collision", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  qwen3:8b:
+    cmd: server --port ${PORT}
+ollama:
+  command: ollama
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 8GiB
+        reserve: 1GiB
+`))
+		require.NoError(t, err)
+		err = cfg.AddOllamaModels([]string{"qwen3:8b"})
+		require.ErrorContains(t, err, "conflicts with local model ID")
+	})
+
+	t.Run("rejects unknown fields", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+ollama:
+  unexpected: value
+`))
+		require.ErrorContains(t, err, `ollama: unknown field "unexpected"`)
+	})
+}
+
 func TestConfig_StorePath(t *testing.T) {
 	t.Run("path accepted in writable directory", func(t *testing.T) {
 		dir := t.TempDir()
@@ -1939,17 +2017,6 @@ routing:
         capacity: 1GiB
         reserve: 1GiB
 `, "reserve must be smaller than capacity"},
-		{"missing model memory", `
-models:
-  model:
-    cmd: model --port ${PORT}
-routing:
-  router:
-    use: auto
-    settings:
-      auto:
-        capacity: 2GiB
-`, "memory is required"},
 		{"model does not fit", `
 models:
   model:

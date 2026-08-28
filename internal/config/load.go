@@ -186,6 +186,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		config.Models[modelId] = modelConfig
 	}
 
+	if err := validateOllamaConfig(config); err != nil {
+		return Config{}, err
+	}
+
 	// Normalize routing config. The legacy top-level `matrix`/`groups` keys and
 	// the new `routing.router` block are mutually exclusive: a config may use
 	// either style, never both.
@@ -262,6 +266,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	config.Routing.Router.Settings.Matrix = config.Matrix
 	config.Routing.Router.Settings.Groups = config.Groups
+	if config.Ollama.Enabled && config.Routing.Router.Use != "auto" {
+		return Config{}, fmt.Errorf("ollama requires routing.router.use: auto")
+	}
 
 	if config.Routing.Scheduler.Use == "" {
 		config.Routing.Scheduler.Use = "fifo"
@@ -333,12 +340,29 @@ func validateAutoRouterConfig(config Config) error {
 	sort.Strings(modelIDs)
 	for _, modelID := range modelIDs {
 		memory := config.Models[modelID].Memory
-		if memory == 0 {
-			return fmt.Errorf("model %s: memory is required when routing.router.use is 'auto'", modelID)
-		}
 		if memory > usable {
 			return fmt.Errorf("model %s: memory reservation exceeds usable auto-router capacity", modelID)
 		}
+	}
+	return nil
+}
+
+func validateOllamaConfig(config Config) error {
+	ollama := config.Ollama
+	if !ollama.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(ollama.Command) == "" {
+		return fmt.Errorf("ollama.command must not be empty")
+	}
+	if ollama.StartPort < 1 || ollama.StartPort > 65535 {
+		return fmt.Errorf("ollama.startPort must be between 1 and 65535")
+	}
+	if ollama.NumParallel < 1 {
+		return fmt.Errorf("ollama.numParallel must be greater than zero")
+	}
+	if ollama.ContextLength < 0 {
+		return fmt.Errorf("ollama.contextLength must be >= 0")
 	}
 	return nil
 }
