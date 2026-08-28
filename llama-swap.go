@@ -37,6 +37,12 @@ var (
 
 const shutdownTimeout = 30 * time.Second
 
+// forceKillTimeout bounds how long the forced teardown path waits for the
+// SIGKILL / taskkill of every upstream process tree to be delivered before the
+// process exits anyway. Short on purpose: it is only reached when the operator
+// has already asked twice for llama-swap to stop.
+const forceKillTimeout = 2 * time.Second
+
 // logTimeFormats maps the cfg.LogTimeFormat value to a Go time layout. An
 // unset or unrecognised value yields "" — no timestamp prefix.
 var logTimeFormats = map[string]string{
@@ -335,7 +341,10 @@ func main() {
 		}
 	}
 
-	sigChan := make(chan os.Signal, 1)
+	// Buffered generously: a second SIGINT arrives while the handler goroutine
+	// is dispatching the first one, and dropping it would defeat the whole
+	// point of the force-exit path below.
+	sigChan := make(chan os.Signal, 8)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	go func() {
@@ -360,65 +369,90 @@ func main() {
 
 	exitChan := make(chan struct{})
 
+	// gracefulShutdown runs the ordered teardown: stop accepting traffic, drain
+	// inflight requests, then stop the upstream processes. It runs on its own
+	// goroutine so the signal loop stays responsive and can escalate to a
+	// forced kill if the operator interrupts again.
+	gracefulShutdown := func() {
+		watcherCancel()
+
+		// Backstop against a stalled shutdown: force the process to
+		// exit once the whole graceful sequence has had its full budget.
+		// On Windows the Job Object reaps upstream processes on exit, so
+		// a forced exit still cleans up rather than orphaning children.
+		go func() {
+			time.Sleep(shutdownTimeout + 5*time.Second)
+			proxyLog.Warnf("graceful shutdown exceeded %v, forcing exit", shutdownTimeout)
+			process.KillAll(forceKillTimeout)
+			os.Exit(1)
+		}()
+
+		activeMu.RLock()
+		srv := activeSrv
+		st := activeStore
+		activeMu.RUnlock()
+
+		// Close long-lived SSE streams first so httpServer.Shutdown can
+		// drain without blocking on them for the full timeout.
+		srv.CloseStreams()
+
+		// Both phases share a single deadline so total shutdown is
+		// bounded by shutdownTimeout rather than 2x it.
+		deadline := time.Now().Add(shutdownTimeout)
+		shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			proxyLog.Warnf("http server shutdown error: %v", err)
+		}
+
+		// Clamp the remaining budget to a small positive value: a
+		// non-positive timeout makes the router fall back to its own
+		// healthCheckTimeout, which would defeat the shared deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			remaining = time.Millisecond
+		}
+		if err := srv.Shutdown(remaining); err != nil {
+			proxyLog.Warnf("router shutdown error: %v", err)
+		}
+
+		if perfMon != nil {
+			perfMon.Stop()
+		}
+		if err := st.Close(); err != nil {
+			proxyLog.Warnf("store shutdown error: %v", err)
+		}
+
+		close(exitChan)
+	}
+
 	go func() {
+		shuttingDown := false
 		for {
 			sig := <-sigChan
 			switch sig {
 			case syscall.SIGHUP:
+				if shuttingDown {
+					proxyLog.Debugf("ignoring SIGHUP, shutdown already in progress")
+					continue
+				}
 				proxyLog.Info("received SIGHUP, reloading config")
 				go reload()
 			case syscall.SIGINT, syscall.SIGTERM:
-				proxyLog.Infof("received signal %v, shutting down", sig)
-				watcherCancel()
-
-				// Backstop against a stalled shutdown: force the process to
-				// exit once the whole graceful sequence has had its full budget.
-				// On Windows the Job Object reaps upstream processes on exit, so
-				// a forced exit still cleans up rather than orphaning children.
-				go func() {
-					time.Sleep(shutdownTimeout + 5*time.Second)
-					proxyLog.Warnf("graceful shutdown exceeded %v, forcing exit", shutdownTimeout)
+				if shuttingDown {
+					// The operator asked twice: stop waiting on graceful
+					// timeouts and take the upstream processes down with
+					// SIGKILL (taskkill /f on Windows) right now. Skipping the
+					// routers here is deliberate — a shutdown that is slow
+					// enough to be interrupted may be stuck inside them.
+					proxyLog.Warnf("received signal %v during shutdown, force killing upstream processes", sig)
+					killed := process.KillAll(forceKillTimeout)
+					proxyLog.Warnf("force killed %d upstream process(es), exiting", killed)
 					os.Exit(1)
-				}()
-
-				activeMu.RLock()
-				srv := activeSrv
-				st := activeStore
-				activeMu.RUnlock()
-
-				// Close long-lived SSE streams first so httpServer.Shutdown can
-				// drain without blocking on them for the full timeout.
-				srv.CloseStreams()
-
-				// Both phases share a single deadline so total shutdown is
-				// bounded by shutdownTimeout rather than 2x it.
-				deadline := time.Now().Add(shutdownTimeout)
-				shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
-				defer cancel()
-				if err := httpServer.Shutdown(shutdownCtx); err != nil {
-					proxyLog.Warnf("http server shutdown error: %v", err)
 				}
-
-				// Clamp the remaining budget to a small positive value: a
-				// non-positive timeout makes the router fall back to its own
-				// healthCheckTimeout, which would defeat the shared deadline.
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					remaining = time.Millisecond
-				}
-				if err := srv.Shutdown(remaining); err != nil {
-					proxyLog.Warnf("router shutdown error: %v", err)
-				}
-
-				if perfMon != nil {
-					perfMon.Stop()
-				}
-				if err := st.Close(); err != nil {
-					proxyLog.Warnf("store shutdown error: %v", err)
-				}
-
-				close(exitChan)
-				return
+				shuttingDown = true
+				proxyLog.Infof("received signal %v, shutting down (interrupt again to force kill)", sig)
+				go gracefulShutdown()
 			}
 		}
 	}()

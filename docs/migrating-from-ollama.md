@@ -34,6 +34,10 @@ llama-swap's configured reservation rather than measured resident memory,
 models because no Ollama manifest digest exists. `Forever` means llama-swap
 does not track an idle expiry; memory admission can still evict that model.
 
+`ollama list` lists the configured catalogue. Its `ID` is likewise
+`unknown-----` where llama-swap does not have a stable Ollama manifest digest;
+its `SIZE` is `0 B` and `MODIFIED` is `Never` rather than guessed metadata.
+
 ## Catalogue and naming
 
 Managed Ollama models are discovered once at startup from the local catalogue.

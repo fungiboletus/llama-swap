@@ -518,8 +518,13 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
 	}
 
+	// Track the live process tree so process.KillAll can force-terminate it
+	// without going through this process's state machine (see registry.go).
+	registerLiveCmd(cmd)
+
 	go func() {
 		waitErr := cmd.Wait()
+		unregisterLiveCmd(cmd)
 		switch st := p.State(); {
 		case waitErr == nil:
 			p.proxyLogger.Debugf("<%s> process exited cleanly", p.id)

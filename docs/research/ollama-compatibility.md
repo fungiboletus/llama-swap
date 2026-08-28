@@ -73,7 +73,7 @@ invented.
 | --- | --- | --- | --- |
 | `HEAD /` | none | `200`; plain-text heartbeat | CLI connection check |
 | `GET /api/version` | none | `{"version":"<llama-swap version>"}` | API clients |
-| `GET /api/tags` | none | `{"models":[...]}`; each known model has `name` and `model` | discovery and CLI list |
+| `GET /api/tags` | none | `{"models":[...]}`; each known model has `name`, `model`, a CLI-safe `digest`, `size`, and `modified_at` | discovery and CLI list |
 | `POST /api/show` | `model` | `200` for an allowed model; include `capabilities`, with optional truthful `details`, `model_info`, and `messages` | `ollama run` preflight |
 | `GET /api/ps` | none | `{"models":[...]}`; each loaded local model has `name`, `model`, `size`, `size_vram`, `details`, and `expires_at` | `ollama ps` |
 | `POST /api/generate` | `model`, `prompt`; optional `images`, `options`, `stream`, `keep_alive` | NDJSON when streaming, one JSON object when `stream:false`; final response has `done:true` | `ollama run`, direct clients |
@@ -81,10 +81,11 @@ invented.
 
 `/api/tags` may expose configured aliases only if a later compatibility test
 shows a client needs them. The canonical configured public name is otherwise
-the stable listed name. `modified_at`, `size`, and `digest` are useful for
-clients that render a catalogue, but must be omitted or set only from a known
-operator value; local command-backed models do not have Ollama manifests or
-digests.
+the stable listed name. Ollama CLI 0.32.15 unconditionally slices the digest
+when rendering `ollama list`, so each entry must provide a string at least 12
+characters long. llama-swap uses the explicit `unknown-----` marker for a
+model without a stable Ollama manifest digest, plus zero size and modification
+time rather than fabricating model-store metadata.
 
 For `/api/show`, the current CLI inspects `capabilities` to decide whether a
 model supports completion or vision. The first implementation should return

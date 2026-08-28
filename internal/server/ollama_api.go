@@ -73,7 +73,15 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, _ *http.Request) {
 	models := make([]ollamaapi.Tag, 0, len(s.cfg.Models))
 	for name, model := range s.cfg.Models {
 		if !model.Unlisted {
-			models = append(models, ollamaapi.Tag{Name: name, Model: name})
+			// The Ollama CLI slices digest[:12] while rendering `ollama list`.
+			// Command-backed and isolated managed lanes do not expose a stable
+			// manifest digest to llama-swap, so use an explicit CLI-safe marker.
+			// Size and modification time are intentionally zero rather than guessed.
+			models = append(models, ollamaapi.Tag{
+				Name:   name,
+				Model:  name,
+				Digest: unknownOllamaDigest,
+			})
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
@@ -307,7 +315,11 @@ func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, ta
 	}
 
 	body := make(map[string]any, len(options)+3)
-	body["model"] = target.localID
+	upstreamModel := target.localID
+	if configured := s.cfg.Models[target.localID].UseModelName; configured != "" {
+		upstreamModel = configured
+	}
+	body["model"] = upstreamModel
 	body["messages"] = messages
 	body["stream"] = streaming
 	for key, value := range options {

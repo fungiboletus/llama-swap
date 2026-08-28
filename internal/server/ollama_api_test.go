@@ -49,10 +49,7 @@ models:
 			t.Fatalf("status = %d", w.Code)
 		}
 		var response struct {
-			Models []struct {
-				Name  string `json:"name"`
-				Model string `json:"model"`
-			} `json:"models"`
+			Models []ollamaapi.Tag `json:"models"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 			t.Fatalf("decode tags: %v", err)
@@ -60,7 +57,8 @@ models:
 		if got := len(response.Models); got != 1 {
 			t.Fatalf("models = %#v", response.Models)
 		}
-		if response.Models[0].Name != "local-text" {
+		model := response.Models[0]
+		if model.Name != "local-text" || model.Model != "local-text" || model.Digest != unknownOllamaDigest || model.Size != 0 || !model.ModifiedAt.IsZero() {
 			t.Errorf("names = %#v", response.Models)
 		}
 	})
@@ -166,6 +164,7 @@ func TestOllamaAPI_LocalChatAndGenerateTranslation(t *testing.T) {
 models:
   local:
     cmd: server --port ${PORT}
+    useModelName: upstream-local
 `))
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -179,7 +178,7 @@ models:
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode translated request: %v", err)
 		}
-		if request["model"] != "local" || request["temperature"] != float64(0.2) {
+		if request["model"] != "upstream-local" || request["temperature"] != float64(0.2) {
 			t.Errorf("translated request = %#v", request)
 		}
 		json.NewEncoder(w).Encode(map[string]any{
