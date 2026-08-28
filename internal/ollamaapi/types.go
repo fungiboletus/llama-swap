@@ -2,7 +2,10 @@
 // by llama-swap's deliberately limited Ollama compatibility surface.
 package ollamaapi
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Message struct {
 	Role    string          `json:"role"`
@@ -34,6 +37,26 @@ type GenerateRequest struct {
 
 type TagsResponse struct {
 	Models []Tag `json:"models"`
+}
+
+// ProcessResponse is the small /api/ps response shape used by the Ollama CLI.
+// Command-backed models do not have Ollama manifests, so Details is deliberately
+// an empty object rather than guessed metadata.
+type ProcessResponse struct {
+	Models []ProcessModel `json:"models"`
+}
+
+// ProcessModel describes one ready local model process. ExpiresAt uses Ollama's
+// long-lived no-expiry sentinel when llama-swap does not track a deadline.
+type ProcessModel struct {
+	Name          string    `json:"name"`
+	Model         string    `json:"model"`
+	Size          int64     `json:"size"`
+	Digest        string    `json:"digest"`
+	Details       struct{}  `json:"details"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	SizeVRAM      int64     `json:"size_vram"`
+	ContextLength int       `json:"context_length"`
 }
 
 type Tag struct {

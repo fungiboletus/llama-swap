@@ -14,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/hw"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -378,11 +379,16 @@ func TestServer_APIHardwareUnavailable(t *testing.T) {
 }
 
 func TestServer_APIResidency(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{
+		"alpha": process.StateReady,
+		"zeta":  process.StateStarting,
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{
 		Models: map[string]config.ModelConfig{
 			"zeta":  {Memory: 3 << 30},
-			"alpha": {Memory: 2 << 30},
+			"alpha": {Memory: 2 << 30, KeepResident: true},
 		},
 		Routing: config.RoutingConfig{Router: config.RouterConfig{
 			Use: "auto",
@@ -408,9 +414,12 @@ func TestServer_APIResidency(t *testing.T) {
 				UsableCapacityBytes uint64 `json:"usable_capacity_bytes"`
 			} `json:"auto_router"`
 			ModelReservations []struct {
-				Model  string `json:"model"`
-				Bytes  uint64 `json:"bytes"`
-				Source string `json:"source"`
+				Model        string `json:"model"`
+				Bytes        uint64 `json:"bytes"`
+				Source       string `json:"source"`
+				KeepResident bool   `json:"keep_resident"`
+				Loaded       bool   `json:"loaded"`
+				State        string `json:"state"`
 			} `json:"model_reservations"`
 		} `json:"configured"`
 		LiveUsage map[string]string `json:"live_usage"`
@@ -421,7 +430,7 @@ func TestServer_APIResidency(t *testing.T) {
 	if !got.Configured.AutoRouter.Enabled || got.Configured.AutoRouter.CapacityBytes != 8<<30 || got.Configured.AutoRouter.ReserveBytes != 1<<30 || got.Configured.AutoRouter.UsableCapacityBytes != 7<<30 {
 		t.Errorf("auto router = %+v", got.Configured.AutoRouter)
 	}
-	if len(got.Configured.ModelReservations) != 2 || got.Configured.ModelReservations[0].Model != "alpha" || got.Configured.ModelReservations[0].Bytes != 2<<30 || got.Configured.ModelReservations[0].Source != "configured" || got.Configured.ModelReservations[1].Model != "zeta" || got.Configured.ModelReservations[1].Bytes != 3<<30 || got.Configured.ModelReservations[1].Source != "configured" {
+	if len(got.Configured.ModelReservations) != 2 || got.Configured.ModelReservations[0].Model != "alpha" || got.Configured.ModelReservations[0].Bytes != 2<<30 || got.Configured.ModelReservations[0].Source != "configured" || !got.Configured.ModelReservations[0].KeepResident || !got.Configured.ModelReservations[0].Loaded || got.Configured.ModelReservations[0].State != "ready" || got.Configured.ModelReservations[1].Model != "zeta" || got.Configured.ModelReservations[1].Bytes != 3<<30 || got.Configured.ModelReservations[1].Source != "configured" || got.Configured.ModelReservations[1].KeepResident || got.Configured.ModelReservations[1].Loaded || got.Configured.ModelReservations[1].State != "starting" {
 		t.Errorf("model reservations = %+v", got.Configured.ModelReservations)
 	}
 	if got.LiveUsage["source"] == "" {

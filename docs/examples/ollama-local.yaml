@@ -1,0 +1,17 @@
+# Minimal local replacement for an Ollama deployment on a trusted machine or
+# LAN. All locally installed Ollama models are discovered once at startup.
+# Restart llama-swap after pulling or removing a model.
+ollama:
+  command: ollama
+  startPort: 11450
+  contextLength: 32768
+  numParallel: 1
+  memory: 24GiB
+
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 96GiB
+        reserve: 8GiB

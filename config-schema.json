@@ -489,6 +489,11 @@
                         "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
                         "description": "Optional conservative resident-memory override for routing.router.use: auto. When omitted, auto routing uses a persisted isolated calibration when available. Use an unsigned integer with B, KiB, MiB, GiB, or TiB."
                     },
+                    "keepResident": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Soft eviction preference for routing.router.use: auto. Preferred models are evicted after ordinary models, but may still be evicted when needed to admit another model."
+                    },
                     "unloadTimeout": {
                         "type": "integer",
                         "minimum": 0,

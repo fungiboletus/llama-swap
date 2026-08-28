@@ -1,0 +1,36 @@
+# Production-oriented example: inference and administration use different
+# bearer keys. Replace these values with secret-injected values before use.
+apiKeys:
+  - replace-with-inference-key
+adminApiKeys:
+  - replace-with-admin-key
+
+# Ordinary command-backed models share the same auto-router budget as managed
+# Ollama lanes. There is no Ollama forwarding mode in this fork.
+models:
+  embedding-small:
+    cmd: embedding-server --port ${PORT}
+    memory: 4GiB
+    keepResident: true
+    ttl: 0
+    capabilities:
+      in: [text]
+
+ollama:
+  command: ollama
+  startPort: 11450
+  contextLength: 32768
+  numParallel: 1
+  memory: 24GiB
+
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 96GiB
+        reserve: 8GiB
+
+hooks:
+  on_startup:
+    preload: [embedding-small]

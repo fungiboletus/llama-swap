@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -87,6 +88,55 @@ func TestAutoSwapper_PrefersLongerIdleAndCheaperLoad(t *testing.T) {
 	assert.Equal(t, []string{"old"}, p.EvictionFor("next", []string{"busy", "old"}))
 }
 
+func TestAutoSwapper_PrefersOrdinaryModelsOverKeepResidentModels(t *testing.T) {
+	conf := autoConfig(map[string]config.ModelConfig{
+		"preferred": {Memory: 5, KeepResident: true},
+		"ordinary":  {Memory: 5},
+		"next":      {Memory: 6},
+	}, 11)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	require.NoError(t, err)
+
+	// The ordinary model is more recently used, but it remains the first
+	// eviction candidate because keepResident is a stronger soft preference.
+	p.lastUse["preferred"] = time.Now().Add(-time.Hour)
+	p.lastUse["ordinary"] = time.Now()
+	assert.Equal(t, []string{"ordinary"}, p.EvictionFor("next", []string{"preferred", "ordinary"}))
+}
+
+func TestAutoSwapper_EvictsKeepResidentModelWhenCapacityRequiresIt(t *testing.T) {
+	conf := autoConfig(map[string]config.ModelConfig{
+		"preferred": {Memory: 5, KeepResident: true},
+		"next":      {Memory: 6},
+	}, 10)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"preferred"}, p.EvictionFor("next", []string{"preferred"}))
+}
+
+func TestAutoSwapper_LogsPreferredEviction(t *testing.T) {
+	conf := autoConfig(map[string]config.ModelConfig{
+		"preferred": {Memory: 5, KeepResident: true},
+		"next":      {Memory: 6},
+	}, 10)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	var logs bytes.Buffer
+	p, err := newAutoSwapper(conf, logmon.NewWriter(&logs), st, nil)
+	require.NoError(t, err)
+
+	p.OnSwapStart("next", []string{"preferred"})
+	assert.Contains(t, logs.String(), "evicting keep-resident model(s)=[preferred] for target=next reason=capacity required eviction")
+}
+
 func TestAutoSwapper_UnprofiledModelCalibratesAloneAndPersists(t *testing.T) {
 	conf := autoConfig(map[string]config.ModelConfig{"model": {}}, 100)
 	st, err := store.New("")
@@ -141,6 +191,40 @@ func TestAuto_ServesTwoResidentModelsThenEvictsOne(t *testing.T) {
 	}
 	if got := c.runCalls.Load(); got != 1 {
 		t.Errorf("c start calls = %d, want 1", got)
+	}
+}
+
+func TestAuto_SerialPreloadRespectsCapacity(t *testing.T) {
+	first := newFakeProcess("first")
+	first.autoReady = true
+	second := newFakeProcess("second")
+	second.autoReady = true
+	conf := autoConfig(map[string]config.ModelConfig{
+		"first":  {Memory: 6, KeepResident: true},
+		"second": {Memory: 6},
+	}, 10)
+	r, _ := newTestAuto(t, conf, map[string]process.Process{"first": first, "second": second})
+
+	// startPreload invokes the local router serially; these requests exercise
+	// the same deterministic order and prove that preload cannot overcommit
+	// the auto-router budget.
+	for _, modelID := range []string{"first", "second"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, newRequest(modelID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("preload %s status = %d body=%q", modelID, w.Code, w.Body.String())
+		}
+	}
+
+	running := r.RunningModels()
+	if _, found := running["first"]; found {
+		t.Errorf("first remains running after preload overflow: %v", running)
+	}
+	if running["second"] != process.StateReady {
+		t.Errorf("second state = %q, want ready; running=%v", running["second"], running)
+	}
+	if got := first.stopCalls.Load(); got != 1 {
+		t.Errorf("first stop calls = %d, want 1", got)
 	}
 }
 

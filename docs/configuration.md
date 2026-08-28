@@ -80,6 +80,31 @@ concurrency limit and affects the model's actual memory use, so choose it
 conservatively.
 The isolated lane-port range must not overlap another local service.
 
+## Vision through the Ollama API
+
+Local models opt in to vision with their existing capability declaration:
+
+```yaml
+models:
+  vision-model:
+    cmd: vision-server --port ${PORT}
+    capabilities:
+      in: [text, image]
+```
+
+Managed Ollama lanes inherit this capability from Ollama's startup
+`/api/show` response; a model whose capability cannot be confirmed remains
+text-only. For `POST /api/chat` and `POST /api/generate`, llama-swap accepts
+Ollama's raw base64 `images` array and passes it to the OpenAI-compatible
+upstream as `image_url` data-URL content blocks. JPEG, PNG, and WebP are
+supported. Each decoded image is limited to 32 MiB, with at most eight images
+per message/request and the existing 128 MiB total request limit.
+
+Image validation happens before router admission, so malformed, unsupported,
+or oversized image data never starts or swaps a model. See
+[the opt-in vision smoke guide](ollama-vision-smoke.md) for testing a real
+vision model; it is not part of the automated test suite.
+
 ## Automatic residency memory budget
 
 The `auto` router uses explicit, conservative reservations instead of trying
@@ -133,6 +158,37 @@ On non-Apple hosts, automatic calibration is unavailable in this release, so
 auto-routing configurations must provide `memory` for every model. This keeps
 NVIDIA and ROCm deployments compatible without pretending an aggregate device
 measurement identifies a particular process.
+
+## Soft keep-resident preference and startup preload
+
+For an important model that should survive ordinary churn, set
+`keepResident: true`. This is a soft preference for the `auto` router: it
+evicts ordinary resident models first, then evicts a preferred model only when
+that is necessary to admit another model that fits by itself.
+
+```yaml
+models:
+  embedding-small:
+    cmd: embedding-server --port ${PORT}
+    memory: 4GiB
+    keepResident: true
+    ttl: 0
+
+hooks:
+  on_startup:
+    preload: [embedding-small]
+```
+
+`ttl: 0` remains the only way to disable idle-time unloading. `keepResident`
+does not introduce another keep-alive timer and does not guarantee residency:
+the auto router logs a warning when it must evict a preferred model for
+capacity. Startup preloads run one at a time in the listed order through the
+same router and budget as normal requests. If the list overflows the budget,
+later preloads can evict earlier ones; failures are logged and reported through
+the existing preload event.
+
+`GET /api/residency` lists `keep_resident`, `loaded`, and process `state` next
+to each reservation. Treat these as a snapshot, not an allocation guarantee.
 
 ## Advanced control with `cmd`
 

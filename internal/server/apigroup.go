@@ -14,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -467,9 +468,12 @@ func (s *Server) handleAPIHardware(w http.ResponseWriter, r *http.Request) {
 // whose CPU/GPU values are host-wide aggregate telemetry.
 func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
 	type modelReservation struct {
-		Model  string `json:"model"`
-		Bytes  uint64 `json:"bytes"`
-		Source string `json:"source"`
+		Model        string `json:"model"`
+		Bytes        uint64 `json:"bytes"`
+		Source       string `json:"source"`
+		KeepResident bool   `json:"keep_resident"`
+		Loaded       bool   `json:"loaded"`
+		State        string `json:"state"`
 	}
 	type autoRouter struct {
 		Enabled             bool   `json:"enabled"`
@@ -488,6 +492,7 @@ func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
 	if reporter, ok := s.local.(router.ResidencyReporter); ok {
 		info = reporter.ResidencyInfo()
 	}
+	running := s.local.RunningModels()
 	for _, modelID := range modelIDs {
 		reservation := router.ResidencyInfo{
 			Bytes:  uint64(s.cfg.Models[modelID].Memory),
@@ -496,10 +501,17 @@ func (s *Server) handleAPIResidency(w http.ResponseWriter, r *http.Request) {
 		if found, ok := info[modelID]; ok {
 			reservation = found
 		}
+		state, loaded := running[modelID]
+		if !loaded {
+			state = process.StateStopped
+		}
 		reservations = append(reservations, modelReservation{
-			Model:  modelID,
-			Bytes:  reservation.Bytes,
-			Source: reservation.Source,
+			Model:        modelID,
+			Bytes:        reservation.Bytes,
+			Source:       reservation.Source,
+			KeepResident: s.cfg.Models[modelID].KeepResident,
+			Loaded:       state == process.StateReady,
+			State:        string(state),
 		})
 	}
 

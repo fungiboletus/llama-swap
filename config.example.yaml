@@ -324,6 +324,13 @@ models:
     # - a value of 0 disables automatic unloading of the model
     ttl: 60
 
+    # keepResident: a soft preference for the auto router to keep this model
+    # loaded. Ordinary models are evicted first, but this model is still
+    # evicted when capacity is required for an admissible request.
+    # - optional, default: false
+    # - does not replace ttl: 0, which remains the idle-unload setting
+    keepResident: true
+
     # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
     # - optional, default: global unloadTimeout
     # - a value of 0 uses the global unloadTimeout
@@ -520,8 +527,10 @@ hooks:
     # preload: a list of model ids to load on startup
     # - optional, default: empty list
     # - model names must match keys in the models sections
-    # - when preloading multiple models at once, define a group
-    #   otherwise models will be loaded and swapped out
+    # - preloads run one at a time in listed order. With the auto router, each
+    #   load uses the normal memory budget and can evict an earlier preload.
+    # - with group or matrix routing, configure a compatible group/set when
+    #   several models must remain loaded together.
     preload:
       - "llama"
 

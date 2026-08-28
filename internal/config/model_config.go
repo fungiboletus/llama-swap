@@ -91,6 +91,10 @@ type ModelConfig struct {
 	// It is an operator-provided reservation, not live process telemetry.
 	Memory ByteSize `yaml:"memory"`
 
+	// KeepResident is a soft auto-router eviction preference. It never prevents
+	// eviction when capacity is needed for another admissible model.
+	KeepResident bool `yaml:"keepResident"`
+
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`

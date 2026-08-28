@@ -149,6 +149,7 @@ func TestServer_RouteAccessPolicy(t *testing.T) {
 		{"GET /health", routeInference},
 		{"GET /api/version", routeInference},
 		{"GET /api/tags", routeInference},
+		{"GET /api/ps", routeInference},
 		{"POST /api/chat", routeInference},
 		{"GET /logs", routeAdmin},
 		{"/upstream/{upstreamPath...}", routeAdmin},

@@ -193,6 +193,12 @@ func (p *autoSwapper) EvictionFor(target string, running []string) []string {
 
 func (p *autoSwapper) OnSwapStart(target string, running []string) {
 	evict := p.EvictionFor(target, running)
+	preferredEvictions := make([]string, 0, len(evict))
+	for _, modelID := range evict {
+		if model, found := p.conf.Models[modelID]; found && model.KeepResident {
+			preferredEvictions = append(preferredEvictions, modelID)
+		}
+	}
 	p.mu.Lock()
 	targetBytes, known := p.reservationLocked(target)
 	used := uint64(0)
@@ -203,6 +209,9 @@ func (p *autoSwapper) OnSwapStart(target string, running []string) {
 	}
 	p.mu.Unlock()
 	if p.logger != nil {
+		if len(preferredEvictions) > 0 {
+			p.logger.Warnf("auto: evicting keep-resident model(s)=%v for target=%s reason=capacity required eviction", preferredEvictions, target)
+		}
 		reason := "fits configured or calibrated reservation"
 		if !known {
 			reason = "unprofiled model is calibrated in isolation"
@@ -332,6 +341,11 @@ func (r *Auto) ResidencyInfo() map[string]ResidencyInfo {
 }
 
 func (p *autoSwapper) moreEvictableLocked(a, b string, now time.Time) bool {
+	aPreferred := p.conf.Models[a].KeepResident
+	bPreferred := p.conf.Models[b].KeepResident
+	if aPreferred != bPreferred {
+		return !aPreferred
+	}
 	score := func(id string) int64 {
 		idle := time.Duration(0)
 		if last, ok := p.lastUse[id]; ok {

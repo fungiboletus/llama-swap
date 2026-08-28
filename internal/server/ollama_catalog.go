@@ -23,6 +23,15 @@ type ollamaTagsResponse struct {
 	} `json:"models"`
 }
 
+type ollamaShowResponse struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+type ollamaCatalogModel struct {
+	Name   string
+	Vision bool
+}
+
 // prepareOllamaModels discovers the local catalogue through a
 // short-lived, private Ollama server and adds one process configuration per
 // discovered model. The temporary server does not receive inference traffic
@@ -33,17 +42,32 @@ func prepareOllamaModels(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 
-	names, err := discoverOllamaModels(ctx, cfg.Ollama.Command)
+	catalogue, err := discoverOllamaModels(ctx, cfg.Ollama.Command)
 	if err != nil {
 		return err
+	}
+	names := make([]string, 0, len(catalogue))
+	for _, model := range catalogue {
+		names = append(names, model.Name)
 	}
 	if err := cfg.AddOllamaModels(names); err != nil {
 		return err
 	}
+	for _, catalogueModel := range catalogue {
+		if !catalogueModel.Vision {
+			continue
+		}
+		model, found := cfg.Models[catalogueModel.Name]
+		if !found {
+			continue
+		}
+		model.Capabilities.In = append(model.Capabilities.In, "image")
+		cfg.Models[catalogueModel.Name] = model
+	}
 	return nil
 }
 
-func discoverOllamaModels(parent context.Context, command string) ([]string, error) {
+func discoverOllamaModels(parent context.Context, command string) ([]ollamaCatalogModel, error) {
 	ctx, cancel := context.WithTimeout(parent, ollamaCatalogTimeout)
 	defer cancel()
 
@@ -79,9 +103,13 @@ func discoverOllamaModels(parent context.Context, command string) ([]string, err
 		}
 		response, err := client.Do(request)
 		if err == nil {
-			defer response.Body.Close()
 			if response.StatusCode == http.StatusOK {
-				return parseOllamaTags(response.Body)
+				names, parseErr := parseOllamaTags(response.Body)
+				_ = response.Body.Close()
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				return discoverOllamaCatalogues(ctx, client, address, names), nil
 			}
 			_ = response.Body.Close()
 		}
@@ -97,6 +125,31 @@ func discoverOllamaModels(parent context.Context, command string) ([]string, err
 	}
 }
 
+// discoverOllamaCatalogues enriches each listed model with the capability
+// Ollama already reports through /api/show. A failed show lookup remains a
+// usable text lane; it merely does not advertise image input.
+func discoverOllamaCatalogues(ctx context.Context, client *http.Client, address string, names []string) []ollamaCatalogModel {
+	models := make([]ollamaCatalogModel, 0, len(names))
+	for _, name := range names {
+		model := ollamaCatalogModel{Name: name}
+		body, _ := json.Marshal(map[string]string{"model": name})
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/api/show", strings.NewReader(string(body)))
+		if err == nil {
+			request.Header.Set("Content-Type", "application/json")
+			response, err := client.Do(request)
+			if err == nil {
+				var show ollamaShowResponse
+				if response.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(&show) == nil {
+					model.Vision = containsString(show.Capabilities, "vision")
+				}
+				_ = response.Body.Close()
+			}
+		}
+		models = append(models, model)
+	}
+	return models
+}
+
 func parseOllamaTags(body io.Reader) ([]string, error) {
 	var tags ollamaTagsResponse
 	decoder := json.NewDecoder(io.LimitReader(body, 16<<20))
@@ -108,4 +161,13 @@ func parseOllamaTags(body io.Reader) ([]string, error) {
 		names = append(names, strings.TrimSpace(model.Name))
 	}
 	return names, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

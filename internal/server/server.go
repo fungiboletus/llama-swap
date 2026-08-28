@@ -160,7 +160,7 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 
 	switch pattern {
 	case "GET /v1/models", "GET /models", "GET /health", "GET /wol-health", "GET /{$}", "HEAD /{$}",
-		"GET /api/version", "GET /api/tags", "POST /api/show", "POST /api/chat", "POST /api/generate":
+		"GET /api/version", "GET /api/tags", "GET /api/ps", "POST /api/show", "POST /api/chat", "POST /api/generate":
 		return routeInference, true
 	case "GET /favicon.ico":
 		return routePublic, true
@@ -362,6 +362,7 @@ func (s *Server) routes() {
 	// entering the same local router and memory scheduler.
 	register("GET /api/version", http.HandlerFunc(s.handleAPIVersion))
 	register("GET /api/tags", http.HandlerFunc(s.handleOllamaTags))
+	register("GET /api/ps", http.HandlerFunc(s.handleOllamaPS))
 	register("POST /api/show", http.HandlerFunc(s.handleOllamaShow))
 	register("POST /api/chat", http.HandlerFunc(s.handleOllamaChat))
 	register("POST /api/generate", http.HandlerFunc(s.handleOllamaGenerate))

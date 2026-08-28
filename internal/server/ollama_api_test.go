@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/ollamaapi"
+	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
 func newOllamaAPITestServer(t *testing.T, cfg config.Config, local *stubRouter) *Server {
@@ -90,6 +92,72 @@ models:
 		if w.Code != http.StatusNotFound || w.Body.String() != "{\"error\":\"model not found\"}\n" {
 			t.Errorf("status=%d body=%q", w.Code, w.Body.String())
 		}
+	})
+}
+
+func TestOllamaAPI_PSReflectsReadyLocalModels(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  alpha:
+    cmd: server --port ${PORT}
+    memory: 2GiB
+    capabilities:
+      context: 4096
+  zeta:
+    cmd: server --port ${PORT}
+  not-ready:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"alpha", "zeta", "not-ready"}, "")
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	assertPS := func(want string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/ps", nil))
+		if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" || w.Body.String() != want {
+			t.Errorf("status=%d content-type=%q body=%q, want %q", w.Code, w.Header().Get("Content-Type"), w.Body.String(), want)
+		}
+	}
+
+	t.Run("empty until a model is ready", func(t *testing.T) {
+		assertPS("{\"models\":[]}\n")
+	})
+
+	t.Run("ready entries are sorted and use only truthful metadata", func(t *testing.T) {
+		local.running = map[string]process.ProcessState{
+			"zeta":         process.StateReady,
+			"alpha":        process.StateReady,
+			"not-ready":    process.StateStarting,
+			"unconfigured": process.StateReady,
+		}
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/ps", nil))
+		var response ollamaapi.ProcessResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode ps response: %v", err)
+		}
+		if got, want := response.Models, 2; len(got) != want {
+			t.Fatalf("models = %#v", got)
+		}
+		alpha, zeta := response.Models[0], response.Models[1]
+		if alpha.Name != "alpha" || alpha.Model != "alpha" || alpha.Size != 2<<30 || alpha.SizeVRAM != 0 || alpha.ContextLength != 4096 || alpha.Digest != unknownOllamaDigest {
+			t.Errorf("alpha = %#v", alpha)
+		}
+		if zeta.Name != "zeta" || zeta.Model != "zeta" || zeta.Size != 0 || zeta.SizeVRAM != 0 || zeta.ContextLength != 0 || zeta.Digest != unknownOllamaDigest {
+			t.Errorf("zeta = %#v", zeta)
+		}
+		if alpha.ExpiresAt.Before(time.Now().Add(20*365*24*time.Hour)) || zeta.ExpiresAt.Before(time.Now().Add(20*365*24*time.Hour)) {
+			t.Errorf("no-expiry sentinel = %s, %s", alpha.ExpiresAt, zeta.ExpiresAt)
+		}
+	})
+
+	t.Run("unloaded transition removes the model", func(t *testing.T) {
+		local.running = map[string]process.ProcessState{"zeta": process.StateStopping}
+		assertPS("{\"models\":[]}\n")
 	})
 }
 
@@ -180,12 +248,118 @@ models:
 	local.serveHTTP = func(http.ResponseWriter, *http.Request) { called = true }
 	s := newOllamaAPITestServer(t, cfg, local)
 	w := httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"local","messages":[{"role":"user","content":"what is this?","images":["not-an-image"]}]}`)))
-	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), "images are not supported") {
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"local","messages":[{"role":"user","content":"what is this?","images":["iVBORw0KGgo="]}]}`)))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "does not declare image input capability") {
 		t.Errorf("status=%d body=%q", w.Code, w.Body.String())
 	}
 	if called {
 		t.Error("unsupported request reached local model")
+	}
+}
+
+func TestOllamaAPI_LocalVisionTranslation(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  vision:
+    cmd: server --port ${PORT}
+    capabilities:
+      in: [text, image]
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	const image = "iVBORw0KGgo="
+	local := newStubRouter([]string{"vision"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode translated request: %v", err)
+		}
+		if request.Model != "vision" || len(request.Messages) != 1 || request.Messages[0].Role != "user" {
+			t.Errorf("translated request = %#v", request)
+		}
+		var content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			ImageURL struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		}
+		if err := json.Unmarshal(request.Messages[0].Content, &content); err != nil {
+			t.Fatalf("decode vision content: %v", err)
+		}
+		if len(content) != 2 || content[0].Type != "text" || content[0].Text != "describe this" || content[1].Type != "image_url" || content[1].ImageURL.URL != "data:image/png;base64,"+image {
+			t.Errorf("vision content = %#v", content)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message":       map[string]any{"content": "an image"},
+				"finish_reason": "stop",
+			}},
+		})
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	for _, tt := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"chat", "/api/chat", `{"model":"vision","messages":[{"role":"user","content":"describe this","images":["` + image + `"]}],"stream":false}`},
+		{"generate", "/api/generate", `{"model":"vision","prompt":"describe this","images":["` + image + `"],"stream":false}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body)))
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "an image") {
+				t.Errorf("status=%d body=%q", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestOllamaAPI_RejectsInvalidImagesBeforeModelStart(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  vision:
+    cmd: server --port ${PORT}
+    capabilities:
+      in: [image]
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"vision"}, "")
+	called := false
+	local.serveHTTP = func(http.ResponseWriter, *http.Request) { called = true }
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	for _, body := range []string{
+		`{"model":"vision","messages":[{"role":"user","content":"x","images":"not-an-array"}]}`,
+		`{"model":"vision","messages":[{"role":"user","content":"x","images":["not base64"]}]}`,
+		`{"model":"vision","messages":[{"role":"user","content":"x","images":["dGV4dA=="]}]}`,
+	} {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status=%d body=%q", w.Code, w.Body.String())
+		}
+	}
+	if called {
+		t.Error("invalid image reached local model")
+	}
+}
+
+func TestOllamaImageURLs_RejectsOversizedImage(t *testing.T) {
+	_, err := ollamaImageURLs(json.RawMessage(`["iVBORw0KGgo="]`), 7)
+	if err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Errorf("error = %v", err)
 	}
 }
 

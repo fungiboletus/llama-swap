@@ -110,7 +110,7 @@ func (c *Config) AddOllamaModels(names []string) error {
 			Memory:             c.Ollama.Memory,
 			ConcurrencyLimit:   c.Ollama.NumParallel,
 			HealthCheckTimeout: c.HealthCheckTimeout,
-			Capabilities:       ModelCapConfig{Context: c.Ollama.ContextLength},
+			Capabilities:       ModelCapConfig{In: []string{"text"}, Context: c.Ollama.ContextLength},
 			Env:                env,
 		}
 	}

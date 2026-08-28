@@ -96,6 +96,13 @@ fields but does not turn an unavailable CPU/GPU split into a hard error. A
 configured total reservation is therefore valid for `size`; `size_vram` must
 be `0` when the managed process has not reported that split.
 
+For the `0.32.15` CLI, a zero `expires_at` is rendered as `Stopping...` because
+the client compares it with the current time before checking whether it is
+zero. Ollama represents an infinite `OLLAMA_KEEP_ALIVE` with its maximum
+duration instead. llama-swap uses that same long-lived response sentinel for a
+ready process with no tracked expiry, so the CLI renders `Forever`; it is not a
+claim that automatic memory admission will never evict the process.
+
 ## Naming decision
 
 Names are an operator-controlled catalogue, not Ollama registry references.

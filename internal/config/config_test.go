@@ -98,6 +98,7 @@ routing:
 	assert.Equal(t, "/", qwen.CheckEndpoint)
 	assert.Equal(t, 2, qwen.ConcurrencyLimit)
 	assert.Equal(t, 32768, qwen.Capabilities.Context)
+	assert.Equal(t, []string{"text"}, qwen.Capabilities.In)
 	assert.Equal(t, ByteSize(24<<30), qwen.Memory)
 	assert.Equal(t, []string{
 		"OLLAMA_HOST=127.0.0.1:12001",
@@ -1978,6 +1979,23 @@ routing:
 	assert.Equal(t, ByteSize(10<<30), cfg.Routing.Router.Settings.Auto.Capacity)
 	assert.Equal(t, ByteSize(2<<30), cfg.Models["small"].Memory)
 	assert.Empty(t, cfg.Groups)
+
+	t.Run("keep resident is an explicit soft preference", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  important:
+    cmd: model --port ${PORT}
+    keepResident: true
+routing:
+  router:
+    use: auto
+    settings:
+      auto:
+        capacity: 2GiB
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.Models["important"].KeepResident)
+	})
 
 	for _, tt := range []struct {
 		name string
