@@ -64,6 +64,9 @@ ollama:
   numParallel: 1
   # optional on Apple: first load is calibrated and persisted
   memory: 24GiB
+  # optional exact reservations for models that cannot be measured reliably
+  memoryByModel:
+    "chess-antoine:latest": 16GiB
 
 routing:
   router:
@@ -74,10 +77,16 @@ routing:
         reserve: 8GiB
 ```
 
-Each lane gets a distinct localhost port, `OLLAMA_MAX_LOADED_MODELS=1`, and an
-infinite Ollama keep-alive. `numParallel` becomes the per-model request-
-concurrency limit and affects the model's actual memory use, so choose it
-conservatively.
+`memoryByModel` overrides the shared `memory` value for matching model IDs;
+other discovered models continue to use `memory` or automatic calibration.
+
+Each lane gets a distinct localhost port, `OLLAMA_MAX_LOADED_MODELS=1`, an
+infinite Ollama keep-alive, and browser-origin allowance for requests already
+proxied through llama-swap. Managed lanes also request Ollama's final streaming
+usage block automatically, allowing the activity store to retain token counts
+and observed throughput without retaining request or response content.
+`numParallel` becomes the per-model request-concurrency limit and affects the
+model's actual memory use, so choose it conservatively.
 The isolated lane-port range must not overlap another local service.
 
 The vision and thinking capabilities Ollama reports for each discovered model

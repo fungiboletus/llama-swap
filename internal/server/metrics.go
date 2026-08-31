@@ -203,6 +203,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
 			tm.Tokens = parsed.Tokens
+			applyObservedStreamingRates(&tm.Tokens, recorder)
 			tm.DurationMs = parsed.DurationMs
 		}
 	} else if gjson.ValidBytes(body) {
@@ -237,6 +238,31 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	tm = stored
 	tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf, reqBody, reqHeaders, body)
 	mp.emitMetric(tm)
+}
+
+// applyObservedStreamingRates fills rates that the upstream did not report.
+// The estimates use only response arrival timestamps: prompt throughput covers
+// request start through the first content delta, while generation throughput
+// covers the intervals between the first and last content deltas. Upstream
+// timings and metrics always take precedence.
+func applyObservedStreamingRates(tokens *TokenMetrics, recorder *responseBodyCopier) {
+	if tokens.PromptPerSecond < 0 && tokens.InputTokens > 0 && !recorder.firstTokenAt.IsZero() {
+		promptTokens := tokens.InputTokens
+		if tokens.CachedTokens > 0 {
+			promptTokens -= tokens.CachedTokens
+		}
+		if elapsed := recorder.firstTokenAt.Sub(recorder.start); promptTokens > 0 && elapsed > 0 {
+			tokens.PromptPerSecond = float64(promptTokens) / elapsed.Seconds()
+		}
+	}
+
+	if tokens.TokensPerSecond < 0 && tokens.OutputTokens > 1 &&
+		!recorder.firstTokenAt.IsZero() && !recorder.lastTokenAt.IsZero() {
+		if elapsed := recorder.lastTokenAt.Sub(recorder.firstTokenAt); elapsed > 0 {
+			// N tokens contain N-1 observable inter-token intervals.
+			tokens.TokensPerSecond = float64(tokens.OutputTokens-1) / elapsed.Seconds()
+		}
+	}
 }
 
 // storeCapture assembles a ReqRespCapture for id, honoring the captureFields
@@ -554,11 +580,14 @@ func filterAcceptEncoding(acceptEncoding string) string {
 // it for metrics parsing. Status defaults to 200 until WriteHeader is called.
 type responseBodyCopier struct {
 	http.ResponseWriter
-	body        *bytes.Buffer
-	tee         io.Writer
-	status      int
-	wroteHeader bool
-	start       time.Time
+	body         *bytes.Buffer
+	tee          io.Writer
+	status       int
+	wroteHeader  bool
+	start        time.Time
+	ssePending   []byte
+	firstTokenAt time.Time
+	lastTokenAt  time.Time
 }
 
 func newBodyCopier(w http.ResponseWriter) *responseBodyCopier {
@@ -582,7 +611,54 @@ func (w *responseBodyCopier) Write(b []byte) (int, error) {
 	if w.status == http.StatusSwitchingProtocols {
 		return w.ResponseWriter.Write(b)
 	}
-	return w.tee.Write(b)
+	n, err := w.tee.Write(b)
+	if n > 0 && strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		w.observeStreamingChunk(b[:n], time.Now())
+	}
+	return n, err
+}
+
+// observeStreamingChunk records when content-bearing SSE deltas arrive. It
+// retains only an unfinished SSE line between writes; the response body itself
+// is already buffered transiently for usage parsing and capture policy decides
+// whether any content is retained after the request.
+func (w *responseBodyCopier) observeStreamingChunk(chunk []byte, observedAt time.Time) {
+	w.ssePending = append(w.ssePending, chunk...)
+	for {
+		nl := bytes.IndexByte(w.ssePending, '\n')
+		if nl < 0 {
+			return
+		}
+		line := bytes.TrimSpace(w.ssePending[:nl])
+		w.ssePending = w.ssePending[nl+1:]
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if !gjson.ValidBytes(data) || !streamingDeltaHasContent(gjson.ParseBytes(data)) {
+			continue
+		}
+		if w.firstTokenAt.IsZero() {
+			w.firstTokenAt = observedAt
+		}
+		w.lastTokenAt = observedAt
+	}
+}
+
+func streamingDeltaHasContent(delta gjson.Result) bool {
+	for _, path := range []string{
+		"choices.0.delta.content",
+		"choices.0.delta.reasoning",
+		"choices.0.delta.reasoning_content",
+		"choices.0.text",
+		"delta.text",
+		"delta.thinking",
+	} {
+		if value := delta.Get(path); value.Exists() && value.String() != "" {
+			return true
+		}
+	}
+	return delta.Get("type").String() == "response.output_text.delta" && delta.Get("delta").String() != ""
 }
 
 func (w *responseBodyCopier) WriteHeader(statusCode int) {

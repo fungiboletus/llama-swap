@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -215,6 +216,52 @@ func TestProcessCommand_StartStop(t *testing.T) {
 	}
 	if body := rr.Body.String(); !strings.Contains(body, `"src":"llama-swap"`) || !strings.Contains(body, "process is not ready") {
 		t.Errorf("after stop: expected llama-swap error envelope, got %q", body)
+	}
+}
+
+func TestProcessCommand_ReverseProxyRewritesHost(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	receivedHost := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		receivedHost <- r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	cmd, _ := simpleResponderCmd(t, "-silent")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              upstream.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+	})
+	t.Cleanup(func() { p.Stop(testStopTimeout) }) //nolint: errcheck
+	_ = runAsync(t, p)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Host = "ai-studio.vpn.sintef:8080"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	select {
+	case got := <-receivedHost:
+		if got != upstreamURL.Host {
+			t.Errorf("upstream Host = %q, want %q", got, upstreamURL.Host)
+		}
+	case <-time.After(testReturnTimeout):
+		t.Fatal("upstream did not receive proxied request")
 	}
 }
 

@@ -14,12 +14,13 @@ const defaultOllamaStartPort = 11450
 // discovers the installed Ollama catalogue at startup and owns one isolated
 // Ollama server process per model while the auto router controls residency.
 type OllamaConfig struct {
-	Enabled       bool     `yaml:"-"`
-	Command       string   `yaml:"command"`
-	StartPort     int      `yaml:"startPort"`
-	ContextLength int      `yaml:"contextLength"`
-	NumParallel   int      `yaml:"numParallel"`
-	Memory        ByteSize `yaml:"memory"`
+	Enabled       bool                `yaml:"-"`
+	Command       string              `yaml:"command"`
+	StartPort     int                 `yaml:"startPort"`
+	ContextLength int                 `yaml:"contextLength"`
+	NumParallel   int                 `yaml:"numParallel"`
+	Memory        ByteSize            `yaml:"memory"`
+	MemoryByModel map[string]ByteSize `yaml:"memoryByModel"`
 }
 
 // UnmarshalYAML applies managed-lane defaults and rejects unrecognized fields.
@@ -33,6 +34,7 @@ func (c *OllamaConfig) UnmarshalYAML(value *yaml.Node) error {
 		"contextLength": {},
 		"numParallel":   {},
 		"memory":        {},
+		"memoryByModel": {},
 	}
 	for i := 0; i < len(value.Content); i += 2 {
 		var key string
@@ -94,6 +96,10 @@ func (c *Config) AddOllamaModels(names []string) error {
 		port := c.Ollama.StartPort + len(c.Models)
 		env := []string{
 			fmt.Sprintf("OLLAMA_HOST=127.0.0.1:%d", port),
+			// Managed lanes are loopback-only, but browser requests proxied through
+			// llama-swap retain their external Origin header. Allow those requests
+			// instead of having Ollama reject the proxy hop with HTTP 403.
+			"OLLAMA_ORIGINS=*",
 			"OLLAMA_MAX_LOADED_MODELS=1",
 			"OLLAMA_KEEP_ALIVE=-1",
 			fmt.Sprintf("OLLAMA_NUM_PARALLEL=%d", c.Ollama.NumParallel),
@@ -101,20 +107,31 @@ func (c *Config) AddOllamaModels(names []string) error {
 		if c.Ollama.ContextLength > 0 {
 			env = append(env, fmt.Sprintf("OLLAMA_CONTEXT_LENGTH=%d", c.Ollama.ContextLength))
 		}
+		memory := c.Ollama.Memory
+		if override, ok := c.Ollama.MemoryByModel[name]; ok {
+			memory = override
+		}
 		c.Models[name] = ModelConfig{
 			Cmd:                fmt.Sprintf("%q serve", c.Ollama.Command),
 			Proxy:              fmt.Sprintf("http://127.0.0.1:%d", port),
 			CheckEndpoint:      "/",
 			UnloadAfter:        c.GlobalTTL,
 			UnloadTimeout:      c.UnloadTimeout,
-			Memory:             c.Ollama.Memory,
+			Memory:             memory,
 			ConcurrencyLimit:   c.Ollama.NumParallel,
 			HealthCheckTimeout: c.HealthCheckTimeout,
 			StallTimeout:       c.StallTimeout,
 			RequestTimeout:     c.RequestTimeout,
 			MaxTokens:          c.MaxTokens,
 			Capabilities:       ModelCapConfig{In: []string{"text"}, Context: c.Ollama.ContextLength},
-			Env:                env,
+			// Ollama's OpenAI-compatible streaming endpoint only includes the
+			// final usage object when this option is requested. Inject it for
+			// managed lanes so activity metrics include token counts regardless
+			// of which client initiated the request.
+			Filters: ModelFilters{Filters: Filters{SetParams: map[string]any{
+				"stream_options.include_usage": true,
+			}}},
+			Env: env,
 		}
 	}
 	return nil

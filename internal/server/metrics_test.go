@@ -60,6 +60,56 @@ func TestServer_ProcessStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestMetricsMonitor_RecordStreamingObservedRates(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	copier := newBodyCopier(w)
+	copier.Header().Set("Content-Type", "text/event-stream")
+	copier.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5}}\n\n" +
+		"data: [DONE]\n\n"))
+
+	copier.start = time.Unix(100, 0)
+	copier.firstTokenAt = copier.start.Add(500 * time.Millisecond)
+	copier.lastTokenAt = copier.firstTokenAt.Add(400 * time.Millisecond)
+	mm.record("m", r, copier, 0, nil, nil)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if got := entries[0].Tokens.PromptPerSecond; got != 40 {
+		t.Errorf("PromptPerSecond = %v, want 40", got)
+	}
+	if got := entries[0].Tokens.TokensPerSecond; got != 10 {
+		t.Errorf("TokensPerSecond = %v, want 10", got)
+	}
+	if entries[0].HasCapture {
+		t.Fatal("captures disabled, HasCapture should be false")
+	}
+}
+
+func TestResponseBodyCopier_ObserveStreamingTokens(t *testing.T) {
+	w := newBodyCopier(httptest.NewRecorder())
+	first := time.Unix(100, 0)
+	last := first.Add(25 * time.Millisecond)
+
+	// A role-only delta is not a generated token, and split SSE lines must be
+	// joined before they are inspected.
+	w.observeStreamingChunk([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"), first)
+	w.observeStreamingChunk([]byte("data: {\"choices\":[{\"delta\":{\"reasoning\":\"hel"), first)
+	w.observeStreamingChunk([]byte("lo\"}}]}\n\n"), first)
+	w.observeStreamingChunk([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n"), last)
+
+	if !w.firstTokenAt.Equal(first) {
+		t.Errorf("firstTokenAt = %v, want %v", w.firstTokenAt, first)
+	}
+	if !w.lastTokenAt.Equal(last) {
+		t.Errorf("lastTokenAt = %v, want %v", w.lastTokenAt, last)
+	}
+}
+
 func TestServer_ProcessStreamingResponse_VLLMMetrics(t *testing.T) {
 	body := []byte(`data: {"id":"chatcmpl-b7a832cea986aea4","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":14,"total_tokens":166,"completion_tokens":152},"metrics":{"time_to_first_token_ms":70,"mean_itl_ms":10,"tokens_per_second":24.116032676555495}}
 

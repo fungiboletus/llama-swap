@@ -78,6 +78,8 @@ ollama:
   contextLength: 32768
   numParallel: 2
   memory: 24GiB
+  memoryByModel:
+    "qwen3:8b": 16GiB
 routing:
   router:
     use: auto
@@ -99,9 +101,12 @@ routing:
 	assert.Equal(t, 2, qwen.ConcurrencyLimit)
 	assert.Equal(t, 32768, qwen.Capabilities.Context)
 	assert.Equal(t, []string{"text"}, qwen.Capabilities.In)
-	assert.Equal(t, ByteSize(24<<30), qwen.Memory)
+	assert.Equal(t, ByteSize(16<<30), qwen.Memory)
+	assert.Equal(t, ByteSize(24<<30), cfg.Models["llama3.2:3b"].Memory)
+	assert.Equal(t, true, qwen.Filters.SetParams["stream_options.include_usage"])
 	assert.Equal(t, []string{
 		"OLLAMA_HOST=127.0.0.1:12001",
+		"OLLAMA_ORIGINS=*",
 		"OLLAMA_MAX_LOADED_MODELS=1",
 		"OLLAMA_KEEP_ALIVE=-1",
 		"OLLAMA_NUM_PARALLEL=2",

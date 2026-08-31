@@ -850,6 +850,15 @@
                     "type": "string",
                     "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$",
                     "description": "Optional conservative reservation for every discovered model. Apple auto routing calibrates an omitted value in isolation; other platforms require one."
+                },
+                "memoryByModel": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string",
+                        "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$"
+                    },
+                    "default": {},
+                    "description": "Optional per-model conservative reservations keyed by exact discovered model ID. A matching entry overrides memory; unmatched models keep the shared value or automatic calibration."
                 }
             },
             "additionalProperties": false,

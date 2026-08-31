@@ -466,6 +466,15 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(proxyURL)
+	director := reverseProxy.Director
+	reverseProxy.Director = func(req *http.Request) {
+		director(req)
+		// NewSingleHostReverseProxy rewrites the URL but deliberately preserves
+		// the incoming Host header. Local runtimes such as Ollama reject a public
+		// llama-swap Host as DNS-rebinding protection, so address the upstream
+		// with the Host that actually owns this connection.
+		req.Host = proxyURL.Host
+	}
 	reverseProxy.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
