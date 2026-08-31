@@ -4,6 +4,6 @@ An opiniated fork of [llama-swap](https://github.com/mostlygeek/llama-swap) feat
 
 - Automatic parallel scheduling. No needs to define huge matrix of models.
 - Admin tokens and user tokens.
-- Features an Ollama API.
+- An Ollama API.
 - Can discover model available in an Ollama instance at start.
 - Double Ctrl-C kills the sub processes immediately.
