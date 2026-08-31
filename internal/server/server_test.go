@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -98,6 +101,24 @@ func newAuthTestServer(cfg config.Config) *Server {
 	s.routes()
 	return s
 }
+
+func newTestServerWithReference(local router.LocalRouter, peer router.Router, fsys fs.FS) *Server {
+	s := newTestServer(local, peer)
+	s.reference = docagent.New(fsys)
+
+	registry, err := mcptools.New(
+		docagent.NewDocsProvider(s.reference),
+		mcptools.NewSysProvider(func() time.Time { return testClock }),
+		config.NewConfigProvider(s.cfg),
+	)
+	if err != nil {
+		panic(err)
+	}
+	s.tools = registry
+	return s
+}
+
+var testClock = time.Date(2026, 3, 14, 15, 9, 26, 0, time.UTC)
 
 func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	t.Helper()
@@ -250,7 +271,7 @@ func TestServer_New_GroupConfig(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -280,7 +301,7 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
@@ -305,7 +326,7 @@ func TestServer_New_AutoConfig(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
 	if err != nil {
 		t.Fatalf("New (auto): %v", err)
 	}

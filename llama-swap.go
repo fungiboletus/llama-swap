@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,7 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/docs"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -42,6 +45,12 @@ const shutdownTimeout = 30 * time.Second
 // process exits anyway. Short on purpose: it is only reached when the operator
 // has already asked twice for llama-swap to stop.
 const forceKillTimeout = 2 * time.Second
+
+// docsConfigSchema remains at the repository root because it is also the
+// public schema URL consumed by deployment tooling.
+//
+//go:embed config-schema.json
+var docsConfigSchema []byte
 
 // logTimeFormats maps the cfg.LogTimeFormat value to a Go time layout. An
 // unset or unrecognised value yields "" — no timestamp prefix.
@@ -190,6 +199,7 @@ func main() {
 	}
 
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
+	referenceDocs := docagent.NewWithSchema(docs.Files, docsConfigSchema)
 
 	initialStorePath := configStorePath(cfg)
 	initialStore, err := store.New(initialStorePath)
@@ -198,7 +208,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, initialStore, buildInfo, hardwareSnapshot)
+	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		initialStore.Close()
@@ -268,7 +278,7 @@ func main() {
 			}
 		}
 
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo, hardwareSnapshot)
+		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			if storeChanged {

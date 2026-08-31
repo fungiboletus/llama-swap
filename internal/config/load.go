@@ -423,6 +423,11 @@ func validateProfiles(config Config) error {
 			}
 		}
 	}
+	if profile := config.Hooks.OnStartup.Profile; profile != "" {
+		if _, found := config.Profiles[profile]; !found {
+			return fmt.Errorf("hooks.on_startup.profile references unknown profile %q", profile)
+		}
+	}
 	return nil
 }
 

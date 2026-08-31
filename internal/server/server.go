@@ -12,9 +12,11 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -31,12 +33,14 @@ type Server struct {
 	proxylog    *logmon.Monitor
 	upstreamlog *logmon.Monitor
 
-	perf     *perf.Monitor
-	inflight *inflightTracker
-	metrics  *metricsMonitor
-	store    *store.Store
-	build    BuildInfo
-	hardware *hw.HardwareSnapshot
+	perf      *perf.Monitor
+	inflight  *inflightTracker
+	metrics   *metricsMonitor
+	store     *store.Store
+	build     BuildInfo
+	hardware  *hw.HardwareSnapshot
+	reference *docagent.Docs
+	tools     *mcptools.Registry
 
 	profileMu     sync.RWMutex
 	activeProfile string
@@ -170,7 +174,8 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
 		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
 		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
-		"GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}":
+		"GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}",
+		"/api/mcp":
 		return routeAdmin, true
 	default:
 		return routePublic, false
@@ -205,7 +210,7 @@ type BuildInfo struct {
 	Date    string
 }
 
-func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot) (*Server, error) {
+func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
 	if err := prepareOllamaModels(context.Background(), &cfg); err != nil {
 		return nil, fmt.Errorf("preparing Ollama models: %w", err)
 	}
@@ -251,11 +256,21 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		store:       st,
 		build:       build,
 		hardware:    hardware,
+		reference:   refs,
 		local:       local,
 		peer:        peer,
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 	}
+	tools, err := mcptools.New(
+		docagent.NewDocsProvider(refs),
+		mcptools.NewSysProvider(nil),
+		config.NewConfigProvider(cfg),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("building the MCP tool registry: %w", err)
+	}
+	s.tools = tools
 	s.routes()
 	if len(cfg.RequiredAPIKeys) == 0 && len(cfg.AdminAPIKeys) == 0 && proxylog != nil {
 		proxylog.Warnf("no apiKeys or adminApiKeys configured; inference and administration are open")
@@ -407,6 +422,7 @@ func (s *Server) routes() {
 	register("GET /api/hardware", http.HandlerFunc(s.handleAPIHardware))
 	register("GET /api/residency", http.HandlerFunc(s.handleAPIResidency))
 	register("GET /api/captures/{id}", http.HandlerFunc(s.handleAPICapture))
+	register("/api/mcp", http.HandlerFunc(s.handleAPIMCP))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
@@ -439,6 +455,12 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
+
+	if s.tools != nil {
+		if err := s.tools.Shutdown(timeout); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	for _, rt := range []router.Router{s.local, s.peer} {
 		if rt == nil {
