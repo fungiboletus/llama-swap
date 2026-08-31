@@ -11,6 +11,12 @@ type Message struct {
 	Role    string          `json:"role"`
 	Content string          `json:"content"`
 	Images  json.RawMessage `json:"images,omitempty"`
+
+	// Thinking carries a reasoning model's chain of thought, which Ollama
+	// keeps separate from Content so clients can render or hide it. Upstream
+	// OpenAI-compatible servers spell the same thing "reasoning_content"
+	// (llama.cpp, vLLM) or "reasoning" (Ollama's own OpenAI endpoint).
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type ChatRequest struct {
@@ -20,19 +26,26 @@ type ChatRequest struct {
 	Options  map[string]json.RawMessage `json:"options,omitempty"`
 	Tools    json.RawMessage            `json:"tools,omitempty"`
 	Think    json.RawMessage            `json:"think,omitempty"`
+
+	// KeepAlive is how long Ollama would hold the model resident. llama-swap
+	// owns residency itself, so the value is ignored — except for the zero
+	// that `ollama stop` sends, which has to be told apart from a load.
+	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
 }
 
 type GenerateRequest struct {
-	Model    string                     `json:"model"`
-	Prompt   string                     `json:"prompt"`
-	Stream   *bool                      `json:"stream,omitempty"`
-	Options  map[string]json.RawMessage `json:"options,omitempty"`
-	Context  json.RawMessage            `json:"context,omitempty"`
-	Suffix   string                     `json:"suffix,omitempty"`
-	System   string                     `json:"system,omitempty"`
-	Template string                     `json:"template,omitempty"`
-	Raw      bool                       `json:"raw,omitempty"`
-	Images   json.RawMessage            `json:"images,omitempty"`
+	Model     string                     `json:"model"`
+	Prompt    string                     `json:"prompt"`
+	Stream    *bool                      `json:"stream,omitempty"`
+	Options   map[string]json.RawMessage `json:"options,omitempty"`
+	Context   json.RawMessage            `json:"context,omitempty"`
+	Suffix    string                     `json:"suffix,omitempty"`
+	System    string                     `json:"system,omitempty"`
+	Template  string                     `json:"template,omitempty"`
+	Raw       bool                       `json:"raw,omitempty"`
+	Images    json.RawMessage            `json:"images,omitempty"`
+	Think     json.RawMessage            `json:"think,omitempty"`
+	KeepAlive json.RawMessage            `json:"keep_alive,omitempty"`
 }
 
 type TagsResponse struct {
@@ -83,6 +96,7 @@ type ChatResponse struct {
 type GenerateResponse struct {
 	Model    string `json:"model"`
 	Response string `json:"response"`
+	Thinking string `json:"thinking,omitempty"`
 	Done     bool   `json:"done"`
 	Reason   string `json:"done_reason,omitempty"`
 }

@@ -176,6 +176,24 @@
             "default": 10,
             "description": "Graceful timeout in seconds when unloading a model (manual, API, or TTL expiry) before force-killing the model process. 0 uses the default of 10 seconds."
         },
+        "stallTimeout": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 600,
+            "description": "Number of seconds an in-flight request may go without any progress from the upstream before llama-swap fails it and stops the model as presumed crashed. The clock is reset by every byte the model sends, so a streaming response only trips it once it goes quiet. The failed request is never retried. 0 disables stall detection. Can be overridden per model with model.stallTimeout."
+        },
+        "requestTimeout": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 1800,
+            "description": "Number of seconds one request may spend being answered before llama-swap fails it, however much progress it is making. Catches a model stuck in a repetition loop, which resets the stallTimeout clock with every token it emits. The model is left running, since it is generating normally. 0 disables the ceiling. Can be overridden per model with model.requestTimeout."
+        },
+        "maxTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 8192,
+            "description": "Ceiling on the number of tokens a request may ask a model to generate. Applied to generation endpoints only. A request asking for fewer keeps its own value; a request that asks for none is given this one. 0 means no ceiling. Can be overridden per model with model.maxTokens."
+        },
         "logLevel": {
             "type": "string",
             "enum": [
@@ -500,6 +518,21 @@
                         "default": 0,
                         "description": "Graceful timeout in seconds when unloading this model (manual, API, or TTL expiry) before force-killing it. 0 uses the global unloadTimeout."
                     },
+                    "stallTimeout": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Number of seconds an in-flight request to this model may go without progress from the upstream before it is failed and the model is stopped as presumed crashed. 0 uses the global stallTimeout; a negative value turns stall detection off for this model."
+                    },
+                    "requestTimeout": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Number of seconds one request to this model may spend being answered before it is failed, however much progress it is making. 0 uses the global requestTimeout; a negative value removes the ceiling for this model."
+                    },
+                    "maxTokens": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Ceiling on the number of tokens a request may ask this model to generate. 0 uses the global maxTokens; a negative value removes the ceiling for this model."
+                    },
                     "useModelName": {
                         "type": "string",
                         "default": "",
@@ -615,6 +648,11 @@
                                 "type": "boolean",
                                 "default": false,
                                 "description": "Whether the model supports the /v1/rerank endpoint."
+                            },
+                            "thinking": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether the model is a reasoning model. Advertised through the Ollama /api/show endpoint, where the Ollama CLI uses it to decide whether to offer thinking. It does not gate requests: a think field is forwarded to the upstream either way."
                             },
                             "context": {
                                 "type": "integer",

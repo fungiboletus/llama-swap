@@ -80,6 +80,11 @@ concurrency limit and affects the model's actual memory use, so choose it
 conservatively.
 The isolated lane-port range must not overlap another local service.
 
+The vision and thinking capabilities Ollama reports for each discovered model
+are carried onto its lane and re-advertised through `/api/show`, so clients see
+the same model they would see talking to Ollama directly. A capability that
+cannot be confirmed is left off.
+
 ## Vision through the Ollama API
 
 Local models opt in to vision with their existing capability declaration:
@@ -234,6 +239,53 @@ models:
         --trust-remote-code
 ```
 
+## Runaway request limits
+
+Three settings bound what a single request can cost, each catching a failure
+the others structurally cannot. All are global with a per-model override, where
+`0` inherits the global value and a negative value opts the model out.
+
+```yaml
+stallTimeout: 600     # upstream went silent -> fail the request, stop the model
+requestTimeout: 1800  # upstream is generating, but forever -> fail the request
+maxTokens: 8192       # never let a request ask for more than this many tokens
+
+models:
+  slow-but-alive:
+    cmd: ...
+    # this one legitimately thinks for a long time before its first token
+    stallTimeout: 1800
+```
+
+**`maxTokens`** (default 8192) is the first and cheapest line of defence: the
+inference server stops on its own, so a looping model ends the request with an
+ordinary `length` finish reason rather than being interrupted. It is a ceiling,
+not an assignment — a request asking for fewer tokens keeps its own value,
+while a request that sets no limit at all is given this one, which is the case
+most likely to run away. It applies to generation endpoints
+(`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`,
+`/completion`, `/infill`, and the Ollama `/api/chat` and `/api/generate`
+bridge) and is ignored on endpoints that generate nothing, such as embeddings
+and reranking. Raise it for a model that legitimately writes long documents;
+set it to `0` to remove it.
+
+**`stallTimeout`** (default 600s) measures progress, not duration. Every byte
+the model sends resets the clock, so a response that streams for an hour is
+fine while a model that has stopped producing anything is not. A local
+inference server that has gone completely silent is wedged rather than
+thinking, so llama-swap fails the request with a `504` **and stops the model**,
+presuming it crashed. The next request routed there starts it again.
+
+**`requestTimeout`** (default 1800s) is the ceiling `stallTimeout` cannot
+enforce. A model stuck repeating itself resets the stall clock with every
+token, so only a limit on total elapsed time ever ends it. Unlike a stall, this
+does **not** stop the model: an upstream that is still producing tokens is
+healthy, and killing it would punish every other caller for one runaway
+request.
+
+None of the three retries anything. The request is failed and the caller
+decides whether to ask again.
+
 ## Many more features..
 
 llama-swap supports many more features to customize how you want to manage your environment.
@@ -247,6 +299,9 @@ llama-swap supports many more features to customize how you want to manage your 
 | `env`     | define environment variables per model         |
 | `aliases` | serve a model with different names             |
 | `filters` | modify requests before sending to the upstream |
+| `stallTimeout` | fail and unload a model that stops responding |
+| `requestTimeout` | fail a request that generates for too long |
+| `maxTokens` | cap how many tokens a request may generate      |
 | `profiles` | switch model ID replacements at runtime       |
 | `...`     | And many more tweaks                           |
 

@@ -2055,3 +2055,59 @@ routing:
 		})
 	}
 }
+
+// TestConfig_StallTimeoutAndMaxTokensInheritance covers the three shapes a
+// model-level limit can take: unset (inherit the global), an override, and a
+// negative value that opts the model out of the global limit entirely.
+func TestConfig_StallTimeoutAndMaxTokensInheritance(t *testing.T) {
+	content := `
+stallTimeout: 300
+requestTimeout: 900
+maxTokens: 4096
+models:
+  inherits:
+    cmd: path/to/cmd --port ${PORT}
+  overrides:
+    cmd: path/to/cmd --port ${PORT}
+    stallTimeout: 60
+    requestTimeout: 120
+    maxTokens: 512
+  optsOut:
+    cmd: path/to/cmd --port ${PORT}
+    stallTimeout: -1
+    requestTimeout: -1
+    maxTokens: -1
+`
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	assert.NoError(t, err)
+
+	assert.Equal(t, 300, config.StallTimeout)
+	assert.Equal(t, 900, config.RequestTimeout)
+	assert.Equal(t, 4096, config.MaxTokens)
+
+	assert.Equal(t, 300, config.Models["inherits"].StallTimeout)
+	assert.Equal(t, 900, config.Models["inherits"].RequestTimeout)
+	assert.Equal(t, 4096, config.Models["inherits"].MaxTokens)
+
+	assert.Equal(t, 60, config.Models["overrides"].StallTimeout)
+	assert.Equal(t, 120, config.Models["overrides"].RequestTimeout)
+	assert.Equal(t, 512, config.Models["overrides"].MaxTokens)
+
+	// A model that opted out resolves to 0, which every consumer reads as off.
+	assert.Equal(t, 0, config.Models["optsOut"].StallTimeout)
+	assert.Equal(t, 0, config.Models["optsOut"].RequestTimeout)
+	assert.Equal(t, 0, config.Models["optsOut"].MaxTokens)
+}
+
+// TestConfig_GlobalLimitsRejectNegativeValues verifies the global settings have
+// no use for the "opt out" spelling: 0 already means off.
+func TestConfig_GlobalLimitsRejectNegativeValues(t *testing.T) {
+	_, err := LoadConfigFromReader(strings.NewReader("stallTimeout: -1\nmodels:\n  m:\n    cmd: cmd --port ${PORT}\n"))
+	assert.ErrorContains(t, err, "stallTimeout must be >= 0")
+
+	_, err = LoadConfigFromReader(strings.NewReader("requestTimeout: -1\nmodels:\n  m:\n    cmd: cmd --port ${PORT}\n"))
+	assert.ErrorContains(t, err, "requestTimeout must be >= 0")
+
+	_, err = LoadConfigFromReader(strings.NewReader("maxTokens: -5\nmodels:\n  m:\n    cmd: cmd --port ${PORT}\n"))
+	assert.ErrorContains(t, err, "maxTokens must be >= 0")
+}

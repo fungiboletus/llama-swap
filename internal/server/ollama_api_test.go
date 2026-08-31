@@ -399,3 +399,324 @@ models:
 		t.Fatal("streaming handler did not return after cancellation")
 	}
 }
+
+// TestOllamaAPI_LatestTagFallsBackBothWays covers the two ways an Ollama client
+// can spell the same model. Which one is configured depends on where the model
+// came from — the discovered catalogue reports `name:latest`, while a
+// command-backed model usually has a bare ID — and clients type either.
+func TestOllamaAPI_LatestTagFallsBackBothWays(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  bare-id:
+    cmd: server --port ${PORT}
+  tagged-id:latest:
+    cmd: server --port ${PORT}
+  other:q4:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	s := newOllamaAPITestServer(t, cfg, newStubRouter([]string{"bare-id", "tagged-id:latest", "other:q4"}, ""))
+
+	resolves := []struct{ requested, wantLocalID string }{
+		{"bare-id", "bare-id"},
+		// `ollama run bare-id:latest` against a bare configured ID.
+		{"bare-id:latest", "bare-id"},
+		{"tagged-id:latest", "tagged-id:latest"},
+		// `ollama run tagged-id` against a catalogue name that carries the tag.
+		{"tagged-id", "tagged-id:latest"},
+	}
+	for _, tc := range resolves {
+		target, found := s.resolveOllamaModel(tc.requested)
+		if !found {
+			t.Errorf("%s: expected to resolve", tc.requested)
+			continue
+		}
+		if target.localID != tc.wantLocalID {
+			t.Errorf("%s resolved to %s, want %s", tc.requested, target.localID, tc.wantLocalID)
+		}
+	}
+
+	// An explicit non-latest tag names one specific model. Missing it is a real
+	// 404, not an invitation to serve a different quantization.
+	for _, requested := range []string{"other", "other:q8", "bare-id:q4", "missing"} {
+		if _, found := s.resolveOllamaModel(requested); found {
+			t.Errorf("%s: expected no match", requested)
+		}
+	}
+}
+
+// TestOllamaAPI_ThinkTranslation covers both directions of thinking support:
+// the `think` request field reaching the upstream in the spellings the
+// supported backends read, and a reasoning trace coming back as Ollama's
+// separate `thinking` field rather than being dropped.
+func TestOllamaAPI_ThinkTranslation(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+    capabilities:
+      thinking: true
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	var seen map[string]any
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode translated request: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{
+					"content":           "4",
+					"reasoning_content": "2 plus 2 is 4",
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	post := func(t *testing.T, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		seen = nil
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return w
+	}
+
+	t.Run("show advertises the thinking capability", func(t *testing.T) {
+		w := post(t, "/api/show", `{"model":"local"}`)
+		var response struct {
+			Capabilities []string `json:"capabilities"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode show: %v", err)
+		}
+		if !contains(response.Capabilities, "thinking") {
+			t.Errorf("capabilities = %v", response.Capabilities)
+		}
+	})
+
+	t.Run("think true enables thinking upstream", func(t *testing.T) {
+		w := post(t, "/api/chat", `{"model":"local","messages":[{"role":"user","content":"2+2"}],"stream":false,"think":true}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		kwargs, ok := seen["chat_template_kwargs"].(map[string]any)
+		if !ok || kwargs["enable_thinking"] != true {
+			t.Errorf("chat_template_kwargs = %#v", seen["chat_template_kwargs"])
+		}
+		if seen["reasoning_effort"] != "medium" {
+			t.Errorf("reasoning_effort = %#v", seen["reasoning_effort"])
+		}
+		want := `{"model":"local","message":{"role":"assistant","content":"4","thinking":"2 plus 2 is 4"},"done":true,"done_reason":"stop"}` + "\n"
+		if got := w.Body.String(); got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("think false asks the model to stop thinking", func(t *testing.T) {
+		post(t, "/api/chat", `{"model":"local","messages":[{"role":"user","content":"2+2"}],"stream":false,"think":false}`)
+		kwargs, ok := seen["chat_template_kwargs"].(map[string]any)
+		if !ok || kwargs["enable_thinking"] != false {
+			t.Errorf("chat_template_kwargs = %#v", seen["chat_template_kwargs"])
+		}
+		// An Ollama upstream ignores chat_template_kwargs entirely, so the
+		// same "off" also goes out as the reasoning_effort it does read.
+		if seen["reasoning_effort"] != "none" {
+			t.Errorf("reasoning_effort = %#v", seen["reasoning_effort"])
+		}
+	})
+
+	t.Run("an effort level carries through", func(t *testing.T) {
+		post(t, "/api/chat", `{"model":"local","messages":[{"role":"user","content":"2+2"}],"stream":false,"think":"high"}`)
+		if seen["reasoning_effort"] != "high" {
+			t.Errorf("reasoning_effort = %#v", seen["reasoning_effort"])
+		}
+	})
+
+	t.Run("an unset think leaves the model's default alone", func(t *testing.T) {
+		w := post(t, "/api/chat", `{"model":"local","messages":[{"role":"user","content":"2+2"}],"stream":false,"think":null}`)
+		if _, present := seen["chat_template_kwargs"]; present {
+			t.Errorf("chat_template_kwargs should be absent, got %#v", seen["chat_template_kwargs"])
+		}
+		// A model that thinks by default still gets its reasoning surfaced.
+		if !strings.Contains(w.Body.String(), `"thinking":"2 plus 2 is 4"`) {
+			t.Errorf("body = %q", w.Body.String())
+		}
+	})
+
+	t.Run("an invalid think is rejected before reaching the model", func(t *testing.T) {
+		w := post(t, "/api/chat", `{"model":"local","messages":[{"role":"user","content":"hi"}],"think":"sometimes"}`)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		if seen != nil {
+			t.Errorf("request reached the model: %#v", seen)
+		}
+	})
+
+	t.Run("generate surfaces thinking too", func(t *testing.T) {
+		w := post(t, "/api/generate", `{"model":"local","prompt":"2+2","stream":false,"think":true}`)
+		want := `{"model":"local","response":"4","thinking":"2 plus 2 is 4","done":true,"done_reason":"stop"}` + "\n"
+		if got := w.Body.String(); got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestOllamaAPI_ThinkStreamsReasoningChunks verifies reasoning is streamed as
+// its own NDJSON chunks, the way Ollama does it, so a client can render the
+// chain of thought separately from the answer.
+func TestOllamaAPI_ThinkStreamsReasoningChunks(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// llama.cpp's spelling, then Ollama's, to prove both are read.
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"},\"finish_reason\":null}]}\n\n"))
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning\":\" ok\"},\"finish_reason\":null}]}\n\n"))
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"4\"},\"finish_reason\":null}]}\n\n"))
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"local","messages":[{"role":"user","content":"2+2"}],"think":true}`)))
+
+	want := `{"model":"local","message":{"role":"assistant","content":"","thinking":"hmm"},"done":false}` + "\n" +
+		`{"model":"local","message":{"role":"assistant","content":"","thinking":" ok"},"done":false}` + "\n" +
+		`{"model":"local","message":{"role":"assistant","content":"4"},"done":false}` + "\n" +
+		`{"model":"local","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}` + "\n"
+	if got := w.Body.String(); got != want {
+		t.Errorf("stream body =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestOllamaAPI_LoadIdiom covers Ollama's "load a model" request: /api/chat
+// with no messages and /api/generate with an empty prompt ask for residency
+// and nothing else. `ollama run` sends one before the first prompt, so getting
+// this wrong breaks the CLI on the step before anything is typed.
+func TestOllamaAPI_LoadIdiom(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	var reached []string
+	okServe := func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Method+" "+r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = okServe
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	post := func(t *testing.T, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		reached = nil
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return w
+	}
+
+	t.Run("chat with no messages loads the model", func(t *testing.T) {
+		w := post(t, "/api/chat", `{"model":"local","messages":[]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		want := `{"model":"local","message":{"role":"assistant","content":""},"done":true,"done_reason":"load"}` + "\n"
+		if got := w.Body.String(); got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+		if len(reached) != 1 {
+			t.Errorf("expected the model to be loaded once, got %v", reached)
+		}
+	})
+
+	t.Run("generate with an empty prompt loads the model", func(t *testing.T) {
+		w := post(t, "/api/generate", `{"model":"local","prompt":""}`)
+		want := `{"model":"local","response":"","done":true,"done_reason":"load"}` + "\n"
+		if got := w.Body.String(); got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+		if len(reached) != 1 {
+			t.Errorf("expected the model to be loaded once, got %v", reached)
+		}
+	})
+
+	// mlx_lm serves nothing at the root, so the load probe comes back 404 from
+	// a server that is running perfectly well. Judging the load by that status
+	// reported "model could not be loaded" for a model that was already up.
+	t.Run("an upstream that has no root route still counts as loaded", func(t *testing.T) {
+		local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			reached = append(reached, r.Method+" "+r.URL.Path)
+			http.NotFound(w, r)
+		}
+		local.running = map[string]process.ProcessState{"local": process.StateReady}
+		t.Cleanup(func() {
+			local.serveHTTP = okServe
+			local.running = nil
+		})
+
+		w := post(t, "/api/chat", `{"model":"local","messages":[]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"done_reason":"load"`) {
+			t.Errorf("body = %q", w.Body.String())
+		}
+	})
+
+	// The failure this must still catch: nothing came up at all.
+	t.Run("a model that does not come up is reported", func(t *testing.T) {
+		local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			reached = append(reached, r.Method+" "+r.URL.Path)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		t.Cleanup(func() { local.serveHTTP = okServe })
+
+		w := post(t, "/api/chat", `{"model":"local","messages":[]}`)
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusBadGateway)
+		}
+	})
+
+	t.Run("a residency hint is still a load", func(t *testing.T) {
+		w := post(t, "/api/chat", `{"model":"local","messages":[],"keep_alive":"5m"}`)
+		if w.Code != http.StatusOK || len(reached) != 1 {
+			t.Errorf("status=%d reached=%v", w.Code, reached)
+		}
+	})
+
+	// `ollama stop` sends the load shape with keep_alive: 0. Loading the model
+	// there would turn "stop" into "start".
+	for _, keepAlive := range []string{`0`, `"0"`, `"0s"`} {
+		t.Run("ollama stop with keep_alive "+keepAlive+" is refused, not loaded", func(t *testing.T) {
+			w := post(t, "/api/chat", `{"model":"local","messages":[],"keep_alive":`+keepAlive+`}`)
+			if w.Code != http.StatusNotImplemented {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusNotImplemented)
+			}
+			if len(reached) != 0 {
+				t.Errorf("model must not be loaded by a stop request, got %v", reached)
+			}
+		})
+	}
+}

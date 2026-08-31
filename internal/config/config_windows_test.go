@@ -58,6 +58,9 @@ models:
 	assert.Equal(t, "info", config.LogLevel)
 	assert.Equal(t, "", config.LogTimeFormat)
 	assert.Equal(t, DEFAULT_UNLOAD_TIMEOUT, config.UnloadTimeout)
+	assert.Equal(t, DEFAULT_STALL_TIMEOUT, config.StallTimeout)
+	assert.Equal(t, DEFAULT_REQUEST_TIMEOUT, config.RequestTimeout)
+	assert.Equal(t, DEFAULT_MAX_TOKENS, config.MaxTokens)
 
 	// Test default group exists
 	defaultGroup, exists := config.Groups["(default)"]
@@ -198,6 +201,9 @@ groups:
 		},
 		SendLoadingState: false,
 		UnloadTimeout:    DEFAULT_UNLOAD_TIMEOUT,
+		StallTimeout:     DEFAULT_STALL_TIMEOUT,
+		RequestTimeout:   DEFAULT_REQUEST_TIMEOUT,
+		MaxTokens:        DEFAULT_MAX_TOKENS,
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -210,6 +216,9 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+				StallTimeout:       DEFAULT_STALL_TIMEOUT,
+				RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
+				MaxTokens:          DEFAULT_MAX_TOKENS,
 			},
 			"model2": {
 				Cmd:                "path/to/server --arg1 one",
@@ -222,6 +231,9 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+				StallTimeout:       DEFAULT_STALL_TIMEOUT,
+				RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
+				MaxTokens:          DEFAULT_MAX_TOKENS,
 			},
 			"model3": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -234,6 +246,9 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+				StallTimeout:       DEFAULT_STALL_TIMEOUT,
+				RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
+				MaxTokens:          DEFAULT_MAX_TOKENS,
 			},
 			"model4": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -246,6 +261,9 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+				StallTimeout:       DEFAULT_STALL_TIMEOUT,
+				RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
+				MaxTokens:          DEFAULT_MAX_TOKENS,
 			},
 		},
 		HealthCheckTimeout: 15,

@@ -28,8 +28,9 @@ type ollamaShowResponse struct {
 }
 
 type ollamaCatalogModel struct {
-	Name   string
-	Vision bool
+	Name     string
+	Vision   bool
+	Thinking bool
 }
 
 // prepareOllamaModels discovers the local catalogue through a
@@ -53,18 +54,30 @@ func prepareOllamaModels(ctx context.Context, cfg *config.Config) error {
 	if err := cfg.AddOllamaModels(names); err != nil {
 		return err
 	}
+	applyOllamaCatalogCapabilities(cfg, catalogue)
+	return nil
+}
+
+// applyOllamaCatalogCapabilities carries what Ollama reported about each
+// discovered model onto the lane configuration generated for it. The lanes are
+// otherwise plain text lanes, and a client asking /api/show would be told the
+// model can do less than it can.
+func applyOllamaCatalogCapabilities(cfg *config.Config, catalogue []ollamaCatalogModel) {
 	for _, catalogueModel := range catalogue {
-		if !catalogueModel.Vision {
-			continue
-		}
 		model, found := cfg.Models[catalogueModel.Name]
 		if !found {
 			continue
 		}
-		model.Capabilities.In = append(model.Capabilities.In, "image")
+		if catalogueModel.Vision {
+			model.Capabilities.In = append(model.Capabilities.In, "image")
+		}
+		// Ollama clients read the thinking capability before deciding whether
+		// `/set think` and `/set nothink` mean anything for this model, so a
+		// lane that drops it warns that a plainly reasoning model "does not
+		// support thinking output".
+		model.Capabilities.Thinking = catalogueModel.Thinking
 		cfg.Models[catalogueModel.Name] = model
 	}
-	return nil
 }
 
 func discoverOllamaModels(parent context.Context, command string) ([]ollamaCatalogModel, error) {
@@ -125,9 +138,9 @@ func discoverOllamaModels(parent context.Context, command string) ([]ollamaCatal
 	}
 }
 
-// discoverOllamaCatalogues enriches each listed model with the capability
+// discoverOllamaCatalogues enriches each listed model with the capabilities
 // Ollama already reports through /api/show. A failed show lookup remains a
-// usable text lane; it merely does not advertise image input.
+// usable text lane; it merely does not advertise image input or thinking.
 func discoverOllamaCatalogues(ctx context.Context, client *http.Client, address string, names []string) []ollamaCatalogModel {
 	models := make([]ollamaCatalogModel, 0, len(names))
 	for _, name := range names {
@@ -141,6 +154,7 @@ func discoverOllamaCatalogues(ctx context.Context, client *http.Client, address 
 				var show ollamaShowResponse
 				if response.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(&show) == nil {
 					model.Vision = containsString(show.Capabilities, "vision")
+					model.Thinking = containsString(show.Capabilities, "thinking")
 				}
 				_ = response.Body.Close()
 			}

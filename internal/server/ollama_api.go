@@ -47,12 +47,28 @@ const (
 
 var errOllamaRequestTooLarge = errors.New("Ollama request exceeds the maximum size")
 
+// resolveOllamaModel maps a requested Ollama name onto a configured model.
+//
+// ":latest" is Ollama's implicit tag, and the two spellings of a name are the
+// same model to every Ollama client: `ollama run qwen3` and `ollama run
+// qwen3:latest` are one command typed two ways. Which spelling llama-swap has
+// configured depends on where the model came from — the discovered Ollama
+// catalogue reports tagged names, while a command-backed model is usually
+// given a bare ID — so the fallback runs in both directions rather than
+// making operators guess which one their clients must type.
+//
+// Only the implicit tag is inferred. A name that already carries some other
+// tag names a specific model, and a miss there is a genuine 404 rather than an
+// invitation to serve a different quantization than the one asked for.
 func (s *Server) resolveOllamaModel(name string) (ollamaModelTarget, bool) {
 	if localID, found := s.cfg.RealModelName(name); found {
 		return ollamaModelTarget{publicName: name, localID: localID}, true
 	}
-	if strings.HasSuffix(name, ":latest") {
-		return s.resolveOllamaExact(strings.TrimSuffix(name, ":latest"))
+	if bare, tagged := strings.CutSuffix(name, ":latest"); tagged {
+		return s.resolveOllamaExact(bare)
+	}
+	if !strings.Contains(name, ":") {
+		return s.resolveOllamaExact(name + ":latest")
 	}
 	return ollamaModelTarget{}, false
 }
@@ -140,6 +156,9 @@ func (s *Server) handleOllamaShow(w http.ResponseWriter, r *http.Request) {
 	if model.Capabilities.Tools {
 		capabilities = append(capabilities, "tools")
 	}
+	if model.Capabilities.Thinking {
+		capabilities = append(capabilities, "thinking")
+	}
 	response := ollamaapi.ShowResponse{Capabilities: capabilities}
 	if model.Capabilities.Context > 0 {
 		response.ModelInfo = map[string]any{"llama.context_length": model.Capabilities.Context}
@@ -167,12 +186,17 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotFound, "model not found")
 		return
 	}
-	if len(request.Tools) > 0 || len(request.Think) > 0 {
-		sendOllamaError(w, http.StatusNotImplemented, "tools and think are not supported for local Ollama compatibility")
+	if len(request.Tools) > 0 {
+		sendOllamaError(w, http.StatusNotImplemented, "tools are not supported for local Ollama compatibility")
+		return
+	}
+	think, err := parseOllamaThink(request.Think)
+	if err != nil {
+		sendOllamaError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if len(request.Messages) == 0 {
-		sendOllamaError(w, http.StatusBadRequest, "Ollama chat request requires messages")
+		s.serveOllamaLoad(w, r, target, request.KeepAlive, false)
 		return
 	}
 	messages, err := translateOllamaMessages(request.Messages, contains(s.cfg.Models[target.localID].Capabilities.In, "image"))
@@ -180,7 +204,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.serveLocalOllamaChat(w, r, target, messages, request.Options, request.Stream, false)
+	s.serveLocalOllamaChat(w, r, target, messages, request.Options, think, request.Stream, false)
 }
 
 func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
@@ -206,12 +230,21 @@ func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotImplemented, "generate context, suffix, system, template, and raw are not supported for local Ollama compatibility")
 		return
 	}
+	if request.Prompt == "" {
+		s.serveOllamaLoad(w, r, target, request.KeepAlive, true)
+		return
+	}
+	think, err := parseOllamaThink(request.Think)
+	if err != nil {
+		sendOllamaError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	messages, err := translateOllamaMessages([]ollamaapi.Message{{Role: "user", Content: request.Prompt, Images: request.Images}}, contains(s.cfg.Models[target.localID].Capabilities.In, "image"))
 	if err != nil {
 		sendOllamaError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.serveLocalOllamaChat(w, r, target, messages, request.Options, request.Stream, true)
+	s.serveLocalOllamaChat(w, r, target, messages, request.Options, think, request.Stream, true)
 }
 
 func decodeOllamaRequest(r *http.Request, destination any) error {
@@ -308,7 +341,7 @@ func sendOllamaError(w http.ResponseWriter, status int, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
-func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, target ollamaModelTarget, messages []openAIChatMessage, options map[string]json.RawMessage, stream *bool, generate bool) {
+func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, target ollamaModelTarget, messages []openAIChatMessage, options map[string]json.RawMessage, think thinkSetting, stream *bool, generate bool) {
 	streaming := true
 	if stream != nil {
 		streaming = *stream
@@ -328,11 +361,33 @@ func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, ta
 			sendOllamaError(w, http.StatusBadRequest, "invalid Ollama options")
 			return
 		}
+		// num_predict is Ollama's spelling of max_tokens. The body being built
+		// here is an OpenAI chat request, where the original name means
+		// nothing, so the option is carried across under the name the upstream
+		// actually reads — and where the generation cap can see it. Ollama
+		// spells "unlimited" as a non-positive num_predict; OpenAI spells it by
+		// omitting the field, which also leaves the cap free to fill in a
+		// ceiling of its own.
+		if key == "num_predict" {
+			count, numeric := option.(float64)
+			if !numeric || count <= 0 {
+				continue
+			}
+			key = "max_tokens"
+		}
 		body[key] = option
 	}
+	// After the options loop: `think` is an explicit request field, so it wins
+	// over anything the same client smuggled through options.
+	think.applyTo(body)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
+		return
+	}
+	encoded, err = applyMaxTokens(encoded, "/v1/chat/completions", s.cfg.Models[target.localID].MaxTokens)
+	if err != nil {
+		sendOllamaError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	translated := r.Clone(r.Context())
@@ -375,32 +430,38 @@ func copyOllamaLocalResponse(w http.ResponseWriter, response *http.Response, mod
 		sendOllamaError(w, http.StatusBadGateway, "local model response could not be read")
 		return
 	}
-	content, reason, err := openAIResponseContent(body)
+	content, thinking, reason, err := openAIResponseContent(body)
 	if err != nil {
 		sendOllamaError(w, http.StatusBadGateway, "local model returned an unsupported response")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if generate {
-		json.NewEncoder(w).Encode(ollamaapi.GenerateResponse{Model: model, Response: content, Done: true, Reason: reason})
+		json.NewEncoder(w).Encode(ollamaapi.GenerateResponse{Model: model, Response: content, Thinking: thinking, Done: true, Reason: reason})
 		return
 	}
-	json.NewEncoder(w).Encode(ollamaapi.ChatResponse{Model: model, Message: ollamaapi.Message{Role: "assistant", Content: content}, Done: true, Reason: reason})
+	json.NewEncoder(w).Encode(ollamaapi.ChatResponse{Model: model, Message: ollamaapi.Message{Role: "assistant", Content: content, Thinking: thinking}, Done: true, Reason: reason})
 }
 
-func openAIResponseContent(body []byte) (string, string, error) {
+// openAIResponseContent returns the answer, the reasoning trace, and the finish
+// reason. Both spellings of the reasoning field are read; see reasoningText.
+func openAIResponseContent(body []byte) (string, string, string, error) {
 	var response struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				Reasoning        string `json:"reasoning"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil || len(response.Choices) == 0 {
-		return "", "", fmt.Errorf("invalid OpenAI response")
+		return "", "", "", fmt.Errorf("invalid OpenAI response")
 	}
-	return response.Choices[0].Message.Content, response.Choices[0].FinishReason, nil
+	choice := response.Choices[0]
+	thinking := reasoningText(choice.Message.ReasoningContent, choice.Message.Reasoning)
+	return choice.Message.Content, thinking, choice.FinishReason, nil
 }
 
 type ollamaStreamWriter struct {
@@ -463,7 +524,7 @@ func (w *ollamaStreamWriter) Flush() {
 
 func (w *ollamaStreamWriter) finish() {
 	if !w.done && w.started {
-		w.writeChunk("", "stop", true)
+		w.writeChunk("", "", "stop", true)
 	}
 }
 
@@ -473,14 +534,16 @@ func (w *ollamaStreamWriter) processLine(line string) error {
 	}
 	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 	if payload == "[DONE]" {
-		w.writeChunk("", "stop", true)
+		w.writeChunk("", "", "stop", true)
 		return nil
 	}
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role             string `json:"role"`
+				Content          string `json:"content"`
+				Reasoning        string `json:"reasoning"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
@@ -489,24 +552,31 @@ func (w *ollamaStreamWriter) processLine(line string) error {
 		return nil
 	}
 	choice := chunk.Choices[0]
+	// Ollama streams reasoning as its own chunks, with thinking set and
+	// content empty, so a client can render the two differently as they
+	// arrive. A delta carrying both is emitted as two chunks for the same
+	// reason.
+	if thinking := reasoningText(choice.Delta.ReasoningContent, choice.Delta.Reasoning); thinking != "" {
+		w.writeChunk("", thinking, "", false)
+	}
 	if choice.Delta.Content != "" {
-		w.writeChunk(choice.Delta.Content, "", false)
+		w.writeChunk(choice.Delta.Content, "", "", false)
 	}
 	if choice.FinishReason != nil {
-		w.writeChunk("", *choice.FinishReason, true)
+		w.writeChunk("", "", *choice.FinishReason, true)
 	}
 	return nil
 }
 
-func (w *ollamaStreamWriter) writeChunk(content, reason string, done bool) {
+func (w *ollamaStreamWriter) writeChunk(content, thinking, reason string, done bool) {
 	if w.done {
 		return
 	}
 	var payload any
 	if w.generate {
-		payload = ollamaapi.GenerateResponse{Model: w.model, Response: content, Done: done, Reason: reason}
+		payload = ollamaapi.GenerateResponse{Model: w.model, Response: content, Thinking: thinking, Done: done, Reason: reason}
 	} else {
-		payload = ollamaapi.ChatResponse{Model: w.model, Message: ollamaapi.Message{Role: "assistant", Content: content}, Done: done, Reason: reason}
+		payload = ollamaapi.ChatResponse{Model: w.model, Message: ollamaapi.Message{Role: "assistant", Content: content, Thinking: thinking}, Done: done, Reason: reason}
 	}
 	if encoded, err := json.Marshal(payload); err == nil {
 		_, _ = w.writer.Write(append(encoded, '\n'))

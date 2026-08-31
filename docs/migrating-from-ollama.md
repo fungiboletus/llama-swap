@@ -24,7 +24,9 @@ The supported API surface is intentionally small:
 - `HEAD /`, `GET /api/version`, `GET /api/tags`, `POST /api/show`, and
   `GET /api/ps`;
 - text `POST /api/chat` and `POST /api/generate`, including streaming;
-- image input for models that declare `capabilities.in: [image]`; and
+- image input for models that declare `capabilities.in: [image]`;
+- thinking, through the `think` request field and a `thinking` response field;
+- Ollama's load idiom, so `ollama run` warms a model before its first prompt; and
 - configured local command-backed models plus managed, locally installed
   Ollama models.
 
@@ -43,7 +45,11 @@ its `SIZE` is `0 B` and `MODIFIED` is `Never` rather than guessed metadata.
 Managed Ollama models are discovered once at startup from the local catalogue.
 Restart llama-swap after `ollama pull` or removing a model. A local model's
 configuration key is its canonical public name; aliases resolve for requests,
-and `name:latest` falls back to `name` when no exact `:latest` model exists.
+and the `:latest` tag is inferred in both directions: `name` and
+`name:latest` resolve to whichever of the two is configured. Only Ollama's
+implicit tag is inferred — a name carrying any other tag names one specific
+model, so a miss there is a genuine 404 rather than a different quantization
+served silently.
 
 An undefined model is never pulled, created, or started. There is no remote
 catalogue lookup or forwarding configuration in this fork. Command-backed
@@ -53,6 +59,47 @@ The following Ollama operations are not implemented: `pull`, `push`, `create`,
 `copy`, `rm`/delete, blobs, remote catalogue discovery, and arbitrary model
 execution. Do not point clients that require these model-management operations
 at llama-swap.
+
+## Loading and stopping
+
+`POST /api/chat` with no messages, and `POST /api/generate` with an empty
+prompt, ask for a model to be made resident and nothing else. Both return
+`done_reason: "load"` once it is ready. `ollama run` sends one of these before
+the first prompt, which is why switching models shows an extra request ahead of
+your own — that request comes from the CLI, not from llama-swap.
+
+`ollama stop` sends the same shape with `keep_alive: 0`. It is refused with a
+`501` rather than honoured: unloading is an administrative operation here,
+guarded by `adminApiKeys`, and an inference client that could stop models on a
+shared host could disrupt everyone else using it. Unload from the web UI or the
+admin API instead. Every other `keep_alive` value is ignored, because residency
+belongs to llama-swap's memory scheduler rather than to the caller.
+
+## Thinking
+
+`think` is accepted on `/api/chat` and `/api/generate` as a boolean or as one
+of `low`, `medium`, `high`. There is no single field every backend reads, so
+both spellings are sent upstream: `chat_template_kwargs.enable_thinking`, which
+llama.cpp, vLLM and SGLang read, and `reasoning_effort`, which Ollama's own
+OpenAI endpoint reads — `none` there, its spelling of thinking turned off, for
+`think: false`. Each server ignores the key it does not know. Omitting `think`
+sends neither, leaving the model's own default in place, which for an Ollama
+lane running a reasoning model means it thinks.
+
+Reasoning comes back in Ollama's separate `thinking` field, read from either
+`reasoning_content` (llama.cpp, vLLM) or `reasoning` (Ollama) on the upstream
+response. Streaming emits reasoning as its own chunks, so a client can render
+the chain of thought apart from the answer. This works whether or not `think`
+was sent — a model that reasons by default has its trace surfaced rather than
+dropped.
+
+Set `capabilities.thinking: true` on a model to have `/api/show` advertise it;
+the Ollama CLI uses that to decide whether `/set think` and `/set nothink` mean
+anything, and warns that the model "does not support thinking output" when it
+is missing. Managed Ollama lanes get it from the catalogue at startup, the same
+way vision is detected, so it only has to be set by hand for command-backed
+models. It is advertisement only and never gates a request, since the upstream
+is the only thing that really knows whether it can honour one.
 
 ## Authentication and the CLI
 

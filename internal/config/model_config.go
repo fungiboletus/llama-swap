@@ -31,11 +31,17 @@ type ModelCapConfig struct {
 	Tools    bool     `yaml:"tools"`
 	Reranker bool     `yaml:"reranker"`
 	Context  int      `yaml:"context"`
+
+	// Thinking marks a reasoning model. It is advertised to clients (the
+	// Ollama CLI uses it to decide whether `/set think` is offered) but never
+	// gates a request: a `think` field is forwarded either way, because the
+	// upstream is the only thing that really knows whether it can honour it.
+	Thinking bool `yaml:"thinking"`
 }
 
 // Empty returns true when all fields are at their zero values.
 func (c ModelCapConfig) Empty() bool {
-	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && c.Context == 0
+	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && !c.Thinking && c.Context == 0
 }
 
 // Validate checks that all modality values are recognized and context is
@@ -118,6 +124,25 @@ type ModelConfig struct {
 
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
+
+	// StallTimeout is the number of seconds an in-flight request to this model
+	// may go without progress from the upstream before llama-swap fails the
+	// request and stops the process as presumed crashed. 0 inherits the global
+	// stallTimeout; a negative value turns stall detection off for this model.
+	// LoadConfigFromReader resolves both forms, so by the time a process reads
+	// this field 0 simply means "disabled".
+	StallTimeout int `yaml:"stallTimeout"`
+
+	// RequestTimeout is the number of seconds one request to this model may
+	// spend being answered before it is failed, however much progress it is
+	// making. Follows the same inheritance rules as StallTimeout.
+	RequestTimeout int `yaml:"requestTimeout"`
+
+	// MaxTokens caps how many tokens a request may ask this model to generate.
+	// 0 inherits the global maxTokens; a negative value removes the cap for
+	// this model. Resolved by LoadConfigFromReader the same way as
+	// StallTimeout, so 0 means "no cap" once loaded.
+	MaxTokens int `yaml:"maxTokens"`
 
 	// Compatibility settings for upstream applications.
 	Compat CompatConfig `yaml:"compat"`

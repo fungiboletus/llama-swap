@@ -38,6 +38,15 @@ type healthCheckKey struct{}
 // Real upstream failures keep the 502. See #1029.
 func newProxyErrorHandler(id string, proxyLogger *logmon.Monitor) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// A watchdog trip cancels the request itself, so it arrives here
+		// looking exactly like a client that hung up. It is the opposite: the
+		// client is still waiting and is owed an answer naming the real cause.
+		if state, ok := watchdogStateFrom(r.Context()); ok && state.tripped() != tripNone {
+			proxyLogger.Warnf("<%s> request failed: %s", id, state.message())
+			swaputil.SendResponse(w, r, http.StatusGatewayTimeout, state.message())
+			return
+		}
+
 		// Pick the log level first: a cancelled request is never an upstream
 		// fault, whether or not the sentinel ends up applying below.
 		switch {
@@ -494,6 +503,11 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		}()
 		reverseProxy.ServeHTTP(w, r)
 	})
+
+	// The watchdog sits outside the panic recovery, so a stream it ends
+	// mid-flight is recovered from ErrAbortHandler the same way as any other
+	// upstream disconnect.
+	handlerFn = p.withWatchdog(handlerFn)
 
 	// cmdCtx + cmd.Cancel are wired as a safety net: if the context is ever
 	// cancelled while the process is alive, cmd.Cancel sends SIGTERM / CmdStop

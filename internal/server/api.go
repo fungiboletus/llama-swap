@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -369,6 +370,35 @@ func (d *discardResponseWriter) Write(p []byte) (int, error) { return len(p), ni
 
 func (d *discardResponseWriter) WriteHeader(status int) { d.status = status }
 
+// loadLocalModel brings a local model to a ready state by sending it a
+// throwaway GET /. Routing it through the router rather than reaching for the
+// process directly is deliberate: admission is part of the request path, so a
+// probe that travels it queues, evicts, and starts exactly like a real request
+// would, instead of duplicating the scheduler's rules out here.
+//
+// Either of two independent signals confirms the load, because neither alone
+// is reliable. The probe's status only says what the upstream thought of
+// GET /, and plenty of healthy inference servers answer that with a 404 —
+// mlx_lm serves nothing at the root. The model's state can just as easily read
+// "not ready" for a model that did load and was then immediately evicted to
+// admit someone else. A failed start trips neither signal, which is the case
+// this needs to catch.
+func (s *Server) loadLocalModel(ctx context.Context, modelID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return fmt.Errorf("build load request for %s: %w", modelID, err)
+	}
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
+
+	dw := &discardResponseWriter{status: http.StatusOK}
+	s.local.ServeHTTP(dw, req)
+
+	if dw.status < http.StatusBadRequest || s.local.RunningModels()[modelID] == process.StateReady {
+		return nil
+	}
+	return fmt.Errorf("model %s did not become ready (load probe returned %d)", modelID, dw.status)
+}
+
 // startPreload fires a background GET / at every model named in
 // Hooks.OnStartup.Preload so they are warm before the first real request.
 // Preload names are already resolved to real model IDs by config loading.
@@ -385,18 +415,10 @@ func (s *Server) startPreload() {
 			}
 			s.proxylog.Infof("preloading model: %s", modelID)
 
-			req, err := http.NewRequestWithContext(s.shutdownCtx, http.MethodGet, "/", nil)
-			if err != nil {
-				continue
-			}
-			req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
-
-			dw := &discardResponseWriter{status: http.StatusOK}
-			s.local.ServeHTTP(dw, req)
-
-			success := dw.status < http.StatusBadRequest
+			err := s.loadLocalModel(s.shutdownCtx, modelID)
+			success := err == nil
 			if !success {
-				s.proxylog.Errorf("failed to preload model %s: status %d", modelID, dw.status)
+				s.proxylog.Errorf("failed to preload model %s: %v", modelID, err)
 			}
 			event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: success})
 		}

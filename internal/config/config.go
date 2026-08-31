@@ -10,6 +10,30 @@ import (
 
 const DEFAULT_GROUP_ID = "(default)"
 const DEFAULT_UNLOAD_TIMEOUT = 10
+
+// DEFAULT_STALL_TIMEOUT bounds how long an in-flight request may go without
+// any progress from the upstream before llama-swap gives up on it, stops the
+// process, and fails the request. Ten minutes of silence from a local
+// inference server is a hang, not a slow answer.
+const DEFAULT_STALL_TIMEOUT = 600
+
+// DEFAULT_REQUEST_TIMEOUT bounds the total time one request may spend being
+// answered, however much progress it is making. It catches what the stall
+// budget structurally cannot: a model in a repetition loop resets the stall
+// clock with every token it emits, and without a ceiling on the whole request
+// it runs until the caller gives up.
+const DEFAULT_REQUEST_TIMEOUT = 1800
+
+// DEFAULT_MAX_TOKENS is the ceiling applied to requests that name no limit of
+// their own. It is chosen to sit above essentially any legitimate local
+// completion — long reasoning traces included — while still being a hard stop
+// on a model that has started generating and cannot stop.
+const DEFAULT_MAX_TOKENS = 8192
+
+// INHERIT_GLOBAL is the model-level value that means "use the global setting".
+// A negative value means "off for this model", which is how a model opts out
+// of a global limit. Both are normalized away by LoadConfigFromReader.
+const INHERIT_GLOBAL = 0
 const (
 	LogToStdoutProxy    = "proxy"
 	LogToStdoutUpstream = "upstream"
@@ -132,21 +156,37 @@ func (c *ProfileConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	HealthCheckTimeout int                       `yaml:"healthCheckTimeout"`
-	LogRequests        bool                      `yaml:"logRequests"`
-	LogLevel           string                    `yaml:"logLevel"`
-	LogTimeFormat      string                    `yaml:"logTimeFormat"`
-	LogToStdout        string                    `yaml:"logToStdout"`
-	MetricsMaxInMemory int                       `yaml:"metricsMaxInMemory"`
-	CaptureBuffer      int                       `yaml:"captureBuffer"`
-	Store              *Store                    `yaml:"store"`
-	UI                 UIConfig                  `yaml:"ui"`
-	Performance        PerformanceConfig         `yaml:"performance"`
-	GlobalTTL          int                       `yaml:"globalTTL"`
-	UnloadTimeout      int                       `yaml:"unloadTimeout"`
-	Models             map[string]ModelConfig    `yaml:"models"` /* key is model ID */
-	Profiles           map[string]ProfileConfig  `yaml:"profiles"`
-	Selectors          map[string]SelectorConfig `yaml:"selectors"`
+	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
+	LogRequests        bool              `yaml:"logRequests"`
+	LogLevel           string            `yaml:"logLevel"`
+	LogTimeFormat      string            `yaml:"logTimeFormat"`
+	LogToStdout        string            `yaml:"logToStdout"`
+	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
+	CaptureBuffer      int               `yaml:"captureBuffer"`
+	Store              *Store            `yaml:"store"`
+	UI                 UIConfig          `yaml:"ui"`
+	Performance        PerformanceConfig `yaml:"performance"`
+	GlobalTTL          int               `yaml:"globalTTL"`
+	UnloadTimeout      int               `yaml:"unloadTimeout"`
+
+	// StallTimeout is the default number of seconds an in-flight request may
+	// go without progress from the upstream before it is failed and the model
+	// is stopped as presumed crashed. 0 disables stall detection globally.
+	StallTimeout int `yaml:"stallTimeout"`
+
+	// RequestTimeout is the default number of seconds one request may spend
+	// being answered before it is failed, regardless of progress. The model is
+	// left running: it is producing tokens, just too many of them. 0 disables
+	// the ceiling globally.
+	RequestTimeout int `yaml:"requestTimeout"`
+
+	// MaxTokens is the default ceiling on the number of tokens a request may
+	// ask the model to generate. 0 means no ceiling.
+	MaxTokens int `yaml:"maxTokens"`
+
+	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
+	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
+	Selectors map[string]SelectorConfig `yaml:"selectors"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.

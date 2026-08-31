@@ -46,6 +46,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
 		UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+		StallTimeout:       DEFAULT_STALL_TIMEOUT,
+		RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
+		MaxTokens:          DEFAULT_MAX_TOKENS,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
@@ -85,6 +88,18 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	if config.UnloadTimeout == 0 {
 		config.UnloadTimeout = DEFAULT_UNLOAD_TIMEOUT
+	}
+
+	// Both of these are "off" at 0 rather than "use a default", so a negative
+	// value has nothing to mean at the global level.
+	if config.StallTimeout < 0 {
+		return Config{}, fmt.Errorf("stallTimeout must be >= 0")
+	}
+	if config.RequestTimeout < 0 {
+		return Config{}, fmt.Errorf("requestTimeout must be >= 0")
+	}
+	if config.MaxTokens < 0 {
+		return Config{}, fmt.Errorf("maxTokens must be >= 0")
 	}
 
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
@@ -151,6 +166,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if modelConfig.UnloadTimeout == 0 {
 			modelConfig.UnloadTimeout = config.UnloadTimeout
 		}
+
+		// Resolve the inheritable limits down to their effective values so
+		// nothing downstream has to know the global config exists.
+		modelConfig.StallTimeout = resolveInherited(modelConfig.StallTimeout, config.StallTimeout)
+		modelConfig.RequestTimeout = resolveInherited(modelConfig.RequestTimeout, config.RequestTimeout)
+		modelConfig.MaxTokens = resolveInherited(modelConfig.MaxTokens, config.MaxTokens)
 
 		if err := modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
@@ -421,4 +442,19 @@ func normalizeHeaderNames(names []string) []string {
 		normalized = append(normalized, name)
 	}
 	return normalized
+}
+
+// resolveInherited normalizes a model-level limit against its global default.
+// INHERIT_GLOBAL (0) takes the global value; a negative value is an explicit
+// opt-out for that model and resolves to 0, which every consumer reads as
+// "disabled". A positive value is the model's own override.
+func resolveInherited(modelValue, globalValue int) int {
+	switch {
+	case modelValue == INHERIT_GLOBAL:
+		return globalValue
+	case modelValue < 0:
+		return 0
+	default:
+		return modelValue
+	}
 }
