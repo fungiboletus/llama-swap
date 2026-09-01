@@ -186,7 +186,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotFound, "model not found")
 		return
 	}
-	if len(request.Tools) > 0 {
+	if hasOllamaTools(request.Tools) {
 		sendOllamaError(w, http.StatusNotImplemented, "tools are not supported for local Ollama compatibility")
 		return
 	}
@@ -226,8 +226,21 @@ func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotFound, "model not found")
 		return
 	}
-	if len(request.Context) > 0 || request.Suffix != "" || request.System != "" || request.Template != "" || request.Raw {
-		sendOllamaError(w, http.StatusNotImplemented, "generate context, suffix, system, template, and raw are not supported for local Ollama compatibility")
+	modelConfig := s.cfg.Models[target.localID]
+	if modelConfig.OllamaManaged {
+		// A managed lane is an isolated Ollama server. Let it interpret the
+		// native request so prompt templates, token-ID context, raw prompts,
+		// suffixes, and system prompts retain Ollama's exact semantics.
+		if request.Prompt == "" && len(request.Context) == 0 {
+			s.serveOllamaLoad(w, r, target, request.KeepAlive, true)
+			return
+		}
+		s.serveManagedOllamaGenerate(w, r, target)
+		return
+	}
+	if len(request.Context) > 0 || request.Suffix != "" || request.Template != "" || request.Raw {
+		sendOllamaError(w, http.StatusNotImplemented,
+			"generate context, suffix, template, and raw require a managed local Ollama model")
 		return
 	}
 	if request.Prompt == "" {
@@ -239,12 +252,65 @@ func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	messages, err := translateOllamaMessages([]ollamaapi.Message{{Role: "user", Content: request.Prompt, Images: request.Images}}, contains(s.cfg.Models[target.localID].Capabilities.In, "image"))
+	generateMessages := make([]ollamaapi.Message, 0, 2)
+	if request.System != "" {
+		generateMessages = append(generateMessages, ollamaapi.Message{Role: "system", Content: request.System})
+	}
+	generateMessages = append(generateMessages, ollamaapi.Message{Role: "user", Content: request.Prompt, Images: request.Images})
+	messages, err := translateOllamaMessages(generateMessages, contains(modelConfig.Capabilities.In, "image"))
 	if err != nil {
 		sendOllamaError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.serveLocalOllamaChat(w, r, target, messages, request.Options, think, request.Stream, true)
+}
+
+// serveManagedOllamaGenerate forwards a native generate request to one of the
+// isolated Ollama lanes. llama-swap remains responsible for choosing and
+// keeping the process resident, so keep_alive is deliberately not forwarded.
+func (s *Server) serveManagedOllamaGenerate(w http.ResponseWriter, r *http.Request, target ollamaModelTarget) {
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
+		return
+	}
+	delete(body, "keep_alive")
+	model, err := json.Marshal(target.localID)
+	if err != nil {
+		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
+		return
+	}
+	body["model"] = model
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
+		return
+	}
+
+	translated := r.Clone(r.Context())
+	translated.URL.Path = "/api/generate"
+	translated.URL.RawPath = ""
+	translated.Body = io.NopCloser(bytes.NewReader(encoded))
+	translated.ContentLength = int64(len(encoded))
+	translated.Header = r.Header.Clone()
+	translated.Header.Set("Content-Type", "application/json")
+	translated.Header.Set("Content-Length", fmt.Sprintf("%d", len(encoded)))
+	translated = translated.WithContext(swaputil.SetContext(translated.Context(), swaputil.ReqContextData{
+		Model:     target.publicName,
+		ModelID:   target.localID,
+		Streaming: requestStreams(body),
+		Metadata:  make(map[string]string),
+	}))
+	s.local.ServeHTTP(w, translated)
+}
+
+func requestStreams(body map[string]json.RawMessage) bool {
+	stream, found := body["stream"]
+	if !found {
+		return true
+	}
+	var enabled bool
+	return json.Unmarshal(stream, &enabled) == nil && enabled
 }
 
 func decodeOllamaRequest(r *http.Request, destination any) error {
@@ -262,6 +328,15 @@ func decodeOllamaRequest(r *http.Request, destination any) error {
 	r.ContentLength = int64(len(body))
 	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	return json.Unmarshal(body, destination)
+}
+
+// hasOllamaTools distinguishes a real tool definition from the empty value
+// emitted by Ollama's Python SDK when callers omit its optional tools argument.
+// An empty list cannot cause a model to call a tool, so it has the same meaning
+// as an omitted or null field and is safe to translate as an ordinary chat.
+func hasOllamaTools(raw json.RawMessage) bool {
+	tools := bytes.TrimSpace(raw)
+	return len(tools) > 0 && !bytes.Equal(tools, []byte("null")) && !bytes.Equal(tools, []byte("[]"))
 }
 
 func translateOllamaMessages(messages []ollamaapi.Message, acceptsImages bool) ([]openAIChatMessage, error) {
@@ -385,7 +460,17 @@ func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, ta
 		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
 		return
 	}
-	encoded, err = applyMaxTokens(encoded, "/v1/chat/completions", s.cfg.Models[target.localID].MaxTokens)
+	// Native Ollama requests bypass the normal JSON filter middleware because
+	// their body is translated above. Apply the configured OpenAI-side filters
+	// now so managed Ollama lanes still request the final streaming usage block
+	// needed by the activity store.
+	modelConfig := s.cfg.Models[target.localID]
+	encoded, err = applyFilters(encoded, target.localID, upstreamModel, modelConfig.Filters.Filters)
+	if err != nil {
+		sendOllamaError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	encoded, err = applyMaxTokens(encoded, "/v1/chat/completions", modelConfig.MaxTokens)
 	if err != nil {
 		sendOllamaError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -398,23 +483,78 @@ func (s *Server) serveLocalOllamaChat(w http.ResponseWriter, r *http.Request, ta
 	translated.Header = r.Header.Clone()
 	translated.Header.Set("Content-Type", "application/json")
 	translated.Header.Set("Content-Length", fmt.Sprintf("%d", len(encoded)))
+	if acceptEncoding := translated.Header.Get("Accept-Encoding"); acceptEncoding != "" {
+		translated.Header.Set("Accept-Encoding", filterAcceptEncoding(acceptEncoding))
+	}
 	translated = translated.WithContext(swaputil.SetContext(translated.Context(), swaputil.ReqContextData{
 		Model:     target.publicName,
 		ModelID:   target.localID,
 		Streaming: streaming,
 		Metadata:  make(map[string]string),
 	}))
+	captureFields, reqBody, reqHeaders := s.captureOllamaActivityRequest(r)
 
 	if streaming {
 		converter := newOllamaStreamWriter(w, target.publicName, generate)
-		s.local.ServeHTTP(converter, translated)
+		recorder := newBodyCopier(converter)
+		// The converter changes the client response to NDJSON, but upstream is
+		// still SSE. Keep observing its content deltas for rate estimates.
+		recorder.observeSSE = true
+		s.local.ServeHTTP(recorder, translated)
 		converter.finish()
+		s.recordOllamaActivity(target.localID, r, recorder, captureFields, reqBody, reqHeaders, true)
 		return
 	}
 
-	recorder := httptest.NewRecorder()
+	response := httptest.NewRecorder()
+	recorder := newBodyCopier(response)
 	s.local.ServeHTTP(recorder, translated)
-	copyOllamaLocalResponse(w, recorder.Result(), target.publicName, generate)
+	copyOllamaLocalResponse(w, response.Result(), target.publicName, generate)
+	s.recordOllamaActivity(target.localID, r, recorder, captureFields, reqBody, reqHeaders, false)
+}
+
+// captureOllamaActivityRequest preserves the original Ollama request for an
+// optional activity capture. The translated OpenAI request is intentionally
+// not captured: the Activity page should identify the API request the client
+// actually sent.
+func (s *Server) captureOllamaActivityRequest(r *http.Request) (captureFields, []byte, map[string]string) {
+	fields := captureFieldsFor(r.URL.Path)
+	if s.metrics == nil || !s.metrics.enableCaptures {
+		return fields, nil, nil
+	}
+
+	var body []byte
+	if fields&captureReqBody != 0 && r.Body != nil {
+		if buffered, err := io.ReadAll(r.Body); err == nil {
+			body = buffered
+			r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+	}
+	var headers map[string]string
+	if fields&captureReqHeaders != 0 {
+		headers = headerMap(r.Header)
+		redactHeaders(headers)
+	}
+	return fields, body, headers
+}
+
+// recordOllamaActivity records the unconverted OpenAI-compatible upstream
+// response. That response is where usage and timings exist; the Ollama wire
+// response intentionally does not expose them. The original request remains
+// attached so the activity path and authenticated user reflect the caller.
+func (s *Server) recordOllamaActivity(modelID string, r *http.Request, recorder *responseBodyCopier, fields captureFields, reqBody []byte, reqHeaders map[string]string, streaming bool) {
+	if s.metrics == nil {
+		return
+	}
+	swaputil.MarkClientClosed(recorder, r)
+	if streaming {
+		// ollamaStreamWriter replaces the client-facing SSE response with NDJSON,
+		// while recorder retains the original SSE body that carries final usage.
+		s.metrics.recordStreaming(modelID, r, recorder, fields, reqBody, reqHeaders)
+		return
+	}
+	s.metrics.record(modelID, r, recorder, fields, reqBody, reqHeaders)
 }
 
 func copyOllamaLocalResponse(w http.ResponseWriter, response *http.Response, model string, generate bool) {

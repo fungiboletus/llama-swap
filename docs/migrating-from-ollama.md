@@ -24,6 +24,8 @@ The supported API surface is intentionally small:
 - `HEAD /`, `GET /api/version`, `GET /api/tags`, `POST /api/show`, and
   `GET /api/ps`;
 - text `POST /api/chat` and `POST /api/generate`, including streaming;
+- `/api/generate` system prompts for every local model; managed local Ollama
+  lanes also preserve native `context`, `suffix`, `template`, and `raw` fields;
 - image input for models that declare `capabilities.in: [image]`;
 - thinking, through the `think` request field and a `thinking` response field;
 - Ollama's load idiom, so `ollama run` warms a model before its first prompt; and

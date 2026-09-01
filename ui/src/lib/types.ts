@@ -58,6 +58,7 @@ export interface ActivityLogEntry {
   req_path: string;
   resp_content_type: string;
   resp_status_code: number;
+  authenticated_user?: string;
   tokens: TokenMetrics;
   duration_ms: number;
   has_capture: boolean;

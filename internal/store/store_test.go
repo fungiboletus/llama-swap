@@ -17,9 +17,10 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 
 	for i, model := range []string{"m1", "m2", "m1"} {
 		_, err := store.InsertActivity(ctx, ActivityLogEntry{
-			Timestamp: time.Unix(int64(100+i), 0),
-			Model:     model,
-			ReqPath:   "/v1/chat/completions",
+			Timestamp:         time.Unix(int64(100+i), 0),
+			Model:             model,
+			ReqPath:           "/v1/chat/completions",
+			AuthenticatedUser: "user-" + model,
 			Tokens: TokenMetrics{
 				InputTokens:     i + 1,
 				OutputTokens:    i + 2,
@@ -45,6 +46,9 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 	}
 	if page.Data[0].Metadata["trace"] != "m1" {
 		t.Fatalf("metadata = %+v", page.Data[0].Metadata)
+	}
+	if page.Data[0].AuthenticatedUser != "user-m1" {
+		t.Fatalf("authenticated user = %q, want user-m1", page.Data[0].AuthenticatedUser)
 	}
 
 	filtered, err := store.ListActivity(ctx, ActivityQuery{

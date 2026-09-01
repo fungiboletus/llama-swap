@@ -152,6 +152,11 @@ type ModelConfig struct {
 
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
+
+	// OllamaManaged identifies a lane generated from the local Ollama
+	// catalogue. It is runtime-only metadata, not a user-configurable model
+	// setting. Such a lane can safely receive native Ollama API requests.
+	OllamaManaged bool `yaml:"-"`
 }
 
 func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {

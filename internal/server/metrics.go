@@ -114,20 +114,31 @@ func (mp *metricsMonitor) Close() error {
 	return nil
 }
 
-// record parses a completed response body and stores/emits an activity entry.
+func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, false)
+}
+
+// recordStreaming records an upstream SSE response whose client-facing
+// representation was converted to a non-SSE format before reaching the caller.
+func (mp *metricsMonitor) recordStreaming(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, true)
+}
+
+// recordResponse parses a completed response body and stores/emits an activity entry.
 // Successful requests store a zstd+CBOR capture (when enabled) with cf
 // controlling which parts are retained. Failed (non-200) requests capture the
 // request only and set ErrorMsg to a description of the failure, so the error
 // can be inspected without storing unreadable raw response bytes. reqBody and
 // reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+func (mp *metricsMonitor) recordResponse(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, upstreamStreaming bool) {
 	tm := ActivityLogEntry{
-		Timestamp:       time.Now(),
-		Model:           modelID,
-		ReqPath:         r.URL.Path,
-		RespContentType: recorder.Header().Get("Content-Type"),
-		RespStatusCode:  recorder.Status(),
-		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
+		Timestamp:         time.Now(),
+		Model:             modelID,
+		ReqPath:           r.URL.Path,
+		RespContentType:   recorder.Header().Get("Content-Type"),
+		RespStatusCode:    recorder.Status(),
+		AuthenticatedUser: strings.TrimSpace(r.Header.Get("X-Authenticated-User")),
+		DurationMs:        int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
 
 	if ctxData, ok := swaputil.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
@@ -198,7 +209,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		body = decoded
 	}
 
-	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
+	if upstreamStreaming || strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
 		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
@@ -585,6 +596,7 @@ type responseBodyCopier struct {
 	status       int
 	wroteHeader  bool
 	start        time.Time
+	observeSSE   bool
 	ssePending   []byte
 	firstTokenAt time.Time
 	lastTokenAt  time.Time
@@ -612,7 +624,7 @@ func (w *responseBodyCopier) Write(b []byte) (int, error) {
 		return w.ResponseWriter.Write(b)
 	}
 	n, err := w.tee.Write(b)
-	if n > 0 && strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+	if n > 0 && (w.observeSSE || strings.Contains(w.Header().Get("Content-Type"), "text/event-stream")) {
 		w.observeStreamingChunk(b[:n], time.Now())
 	}
 	return n, err

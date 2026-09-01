@@ -99,6 +99,7 @@ routing:
 	assert.Equal(t, "http://127.0.0.1:12001", qwen.Proxy)
 	assert.Equal(t, "/", qwen.CheckEndpoint)
 	assert.Equal(t, 2, qwen.ConcurrencyLimit)
+	assert.True(t, qwen.OllamaManaged)
 	assert.Equal(t, 32768, qwen.Capabilities.Context)
 	assert.Equal(t, []string{"text"}, qwen.Capabilities.In)
 	assert.Equal(t, ByteSize(16<<30), qwen.Memory)

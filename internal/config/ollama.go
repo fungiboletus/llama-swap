@@ -123,6 +123,7 @@ func (c *Config) AddOllamaModels(names []string) error {
 			StallTimeout:       c.StallTimeout,
 			RequestTimeout:     c.RequestTimeout,
 			MaxTokens:          c.MaxTokens,
+			OllamaManaged:      true,
 			Capabilities:       ModelCapConfig{In: []string{"text"}, Context: c.Ollama.ContextLength},
 			// Ollama's OpenAI-compatible streaming endpoint only includes the
 			// final usage object when this option is requested. Inject it for

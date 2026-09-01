@@ -197,6 +197,7 @@ describe("activityCellText", () => {
     expect(activityCellText(row, "id")).toBe("42");
     expect(activityCellText(row, "time")).toBe("2026-06-25 12:34:56");
     expect(activityCellText(row, "model")).toBe("llama-3");
+    expect(activityCellText({ ...row, authenticated_user: "alice@example.com" }, "authenticated_user")).toBe("alice@example.com");
     expect(activityCellText(row, "req_path")).toBe("/v1/embeddings");
     expect(activityCellText(row, "resp_status_code")).toBe("500");
     expect(activityCellText(row, "resp_content_type")).toBe("text/event-stream");
@@ -212,6 +213,7 @@ describe("activityCellText", () => {
 
   it("renders dashes for empty values", () => {
     const empty = entry({ req_path: "", resp_content_type: "", resp_status_code: 0 });
+    expect(activityCellText(empty, "authenticated_user")).toBe("-");
     expect(activityCellText(empty, "req_path")).toBe("-");
     expect(activityCellText(empty, "resp_content_type")).toBe("-");
     expect(activityCellText(empty, "resp_status_code")).toBe("-");

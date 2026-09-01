@@ -206,6 +206,237 @@ models:
 	}
 }
 
+func TestOllamaAPI_GenerateSystemPromptForCommandBackedModel(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Messages []openAIChatMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode translated request: %v", err)
+		}
+		if len(request.Messages) != 2 || request.Messages[0].Role != "system" || request.Messages[0].Content != "be brief" || request.Messages[1].Role != "user" || request.Messages[1].Content != "hello" {
+			t.Errorf("messages = %#v", request.Messages)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]any{"content": "hi"}, "finish_reason": "stop",
+		}}})
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(`{"model":"local","prompt":"hello","system":"be brief","stream":false}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestOllamaAPI_ManagedGenerateUsesNativeOllamaRequest(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  native:
+    cmd: server --port ${PORT}
+    aliases: [alias]
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	model := cfg.Models["native"]
+	model.OllamaManaged = true
+	cfg.Models["native"] = model
+
+	local := newStubRouter([]string{"native"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/generate" {
+			t.Errorf("path = %q, want native Ollama endpoint", r.URL.Path)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode native request: %v", err)
+		}
+		if request["model"] != "native" || request["raw"] != true || request["system"] != "be precise" || request["suffix"] != "END" || request["template"] != "{{ .Prompt }}" {
+			t.Errorf("native request = %#v", request)
+		}
+		context, ok := request["context"].([]any)
+		if !ok || len(context) != 3 || context[0] != float64(1) || context[2] != float64(3) {
+			t.Errorf("context = %#v", request["context"])
+		}
+		if _, found := request["keep_alive"]; found {
+			t.Errorf("keep_alive must remain owned by llama-swap: %#v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"native","response":"continued","context":[4,5],"done":true}` + "\n"))
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(`{"model":"alias","prompt":"hello","context":[1,2,3],"suffix":"END","system":"be precise","template":"{{ .Prompt }}","raw":true,"keep_alive":"10m","stream":false}`)))
+	if w.Code != http.StatusOK || w.Body.String() != `{"model":"native","response":"continued","context":[4,5],"done":true}`+"\n" {
+		t.Errorf("status=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestOllamaAPI_RecordsActivity(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message":       map[string]any{"content": "hello back"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"prompt_tokens": 12, "completion_tokens": 7},
+		})
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	for _, request := range []struct {
+		path string
+		body string
+	}{
+		{"/api/chat", `{"model":"local","messages":[{"role":"user","content":"hi"}],"stream":false}`},
+		{"/api/generate", `{"model":"local","prompt":"hi","stream":false}`},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, request.path, strings.NewReader(request.body))
+		r.Header.Set("X-Authenticated-User", "  alice@example.com  ")
+		s.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status=%d body=%q", request.path, w.Code, w.Body.String())
+		}
+	}
+
+	entries := metricsEntries(t, s.metrics)
+	if len(entries) != 2 {
+		t.Fatalf("activity entries = %d, want 2", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Model != "local" {
+			t.Errorf("model = %q, want local", entry.Model)
+		}
+		if entry.ReqPath != "/api/chat" && entry.ReqPath != "/api/generate" {
+			t.Errorf("request path = %q", entry.ReqPath)
+		}
+		if entry.RespStatusCode != http.StatusOK {
+			t.Errorf("response status = %d, want 200", entry.RespStatusCode)
+		}
+		if entry.AuthenticatedUser != "alice@example.com" {
+			t.Errorf("authenticated user = %q, want alice@example.com", entry.AuthenticatedUser)
+		}
+		if entry.Tokens.InputTokens != 12 || entry.Tokens.OutputTokens != 7 {
+			t.Errorf("tokens = %+v, want input=12 output=7", entry.Tokens)
+		}
+	}
+}
+
+func TestOllamaAPI_RecordsStreamingActivity(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+    filters:
+      setParams:
+        stream_options.include_usage: true
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode translated request: %v", err)
+		}
+		streamOptions, ok := request["stream_options"].(map[string]any)
+		if !ok || streamOptions["include_usage"] != true {
+			t.Errorf("stream_options = %#v, want include_usage=true", request["stream_options"])
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n" +
+			"data: [DONE]\n\n"))
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"local","messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("X-Authenticated-User", "alice@example.com")
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+
+	entries := metricsEntries(t, s.metrics)
+	if len(entries) != 1 {
+		t.Fatalf("activity entries = %d, want 1", len(entries))
+	}
+	entry := entries[0]
+	if entry.ReqPath != "/api/chat" || entry.AuthenticatedUser != "alice@example.com" {
+		t.Errorf("activity entry = %#v", entry)
+	}
+	if entry.Tokens.InputTokens != 12 || entry.Tokens.OutputTokens != 7 {
+		t.Errorf("tokens = %+v, want input=12 output=7", entry.Tokens)
+	}
+}
+
+func TestOllamaAPI_EmptyToolsAreNotToolCalls(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: server --port ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	local := newStubRouter([]string{"local"}, "")
+	called := 0
+	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+		called++
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message":       map[string]any{"content": "hello back"},
+				"finish_reason": "stop",
+			}},
+		})
+	}
+	s := newOllamaAPITestServer(t, cfg, local)
+
+	for _, tools := range []string{"", `,"tools":null`, `,"tools":[]`} {
+		called = 0
+		w := httptest.NewRecorder()
+		body := `{"model":"local","messages":[{"role":"user","content":"hi"}],"stream":false` + tools + `}`
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body)))
+		if w.Code != http.StatusOK || called != 1 {
+			t.Errorf("tools %q: status=%d calls=%d body=%q", tools, w.Code, called, w.Body.String())
+		}
+	}
+
+	called = 0
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"local","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"weather"}}]}`)))
+	if w.Code != http.StatusNotImplemented || called != 0 {
+		t.Errorf("tool definition: status=%d calls=%d body=%q", w.Code, called, w.Body.String())
+	}
+}
+
 func TestOllamaAPI_LocalChatStreamsNDJSON(t *testing.T) {
 	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
 models:

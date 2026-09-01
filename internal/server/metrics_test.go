@@ -110,6 +110,24 @@ func TestResponseBodyCopier_ObserveStreamingTokens(t *testing.T) {
 	}
 }
 
+func TestResponseBodyCopier_ObserveSSEThroughOllamaNDJSON(t *testing.T) {
+	client := httptest.NewRecorder()
+	converter := newOllamaStreamWriter(client, "local", false)
+	copier := newBodyCopier(converter)
+	copier.observeSSE = true
+
+	_, err := copier.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+	if err != nil {
+		t.Fatalf("write upstream SSE: %v", err)
+	}
+	if copier.firstTokenAt.IsZero() || copier.lastTokenAt.IsZero() {
+		t.Fatalf("content delta was not observed: first=%s last=%s", copier.firstTokenAt, copier.lastTokenAt)
+	}
+	if got := client.Header().Get("Content-Type"); got != "application/x-ndjson" {
+		t.Errorf("client content type = %q, want application/x-ndjson", got)
+	}
+}
+
 func TestServer_ProcessStreamingResponse_VLLMMetrics(t *testing.T) {
 	body := []byte(`data: {"id":"chatcmpl-b7a832cea986aea4","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":14,"total_tokens":166,"completion_tokens":152},"metrics":{"time_to_first_token_ms":70,"mean_itl_ms":10,"tokens_per_second":24.116032676555495}}
 
@@ -238,6 +256,27 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	}
 	if entries[0].Metadata["trace"] != "abc" {
 		t.Errorf("trace = %q, want abc", entries[0].Metadata["trace"])
+	}
+}
+
+func TestMetricsMonitor_RecordAuthenticatedUser(t *testing.T) {
+	mm := newTestMetricsMonitor(t, nil, 10, 0)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"usage":{}}`))
+	r.Header.Set("X-Authenticated-User", "  alice@example.com  ")
+
+	w := httptest.NewRecorder()
+	copier := newBodyCopier(w)
+	copier.WriteHeader(http.StatusOK)
+	copier.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+
+	mm.record("m", r, copier, 0, nil, nil)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].AuthenticatedUser != "alice@example.com" {
+		t.Errorf("authenticated user = %q, want alice@example.com", entries[0].AuthenticatedUser)
 	}
 }
 

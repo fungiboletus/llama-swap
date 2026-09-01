@@ -111,6 +111,7 @@
     ];
     if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
     cols.push(
+      { id: "authenticated_user", label: "User", defaultVisible: true },
       { id: "req_path", label: "Path", defaultVisible: false },
       { id: "resp_status_code", label: "Status", defaultVisible: true },
       { id: "resp_content_type", label: "Content-Type", defaultVisible: false },
@@ -358,6 +359,12 @@
     }
 
     cols.push(
+      {
+        id: "authenticated_user",
+        accessorKey: "authenticated_user",
+        header: "User",
+        cell: ({ row }) => row.original.authenticated_user || "-",
+      },
       {
         id: "req_path",
         accessorKey: "req_path",
