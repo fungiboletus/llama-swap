@@ -158,15 +158,16 @@ separate CPU and shared/unified-GPU capacities together.
 `GET /api/residency` exposes the configured or learned reservations and budget.
 Use `/api/performance` separately for aggregate host telemetry.
 
-On Apple Silicon, a model with no `memory` override starts by itself once. The
-auto router records the increase in unified memory at readiness and keeps a
-30-second high-water observation only while that model remains the sole
-managed resident model. It never assigns aggregate growth while models share
-the pool, and it never lowers a learned value. The resulting profile is keyed
-to the deployed command/configuration fingerprint and is persisted in the
-SQLite `store.path`; configure a file-backed store to retain it across restarts.
-`GET /api/residency` labels each reservation as `configured`, `calibrated`, or
-`unprofiled`.
+On Apple Silicon, a model with no `memory` override serves its first request by
+itself. The auto router then records the resident-set size of that model's OS
+process tree, including child inference processes, and keeps a 30-second
+high-water observation while it remains loaded. Measurements stay attributable
+to their owning model even when several engines share the pool, and a learned
+value is never lowered. The resulting profile is keyed to the deployed
+command/configuration and observation-method fingerprint and is persisted in
+the SQLite `store.path`; configure a file-backed store to retain it across
+restarts. `GET /api/residency` labels each reservation as `configured`,
+`calibrated`, or `unprofiled`.
 
 On non-Apple hosts, automatic calibration is unavailable in this release, so
 auto-routing configurations must provide `memory` for every model. This keeps

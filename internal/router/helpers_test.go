@@ -73,6 +73,7 @@ type fakeProcess struct {
 	runCalls     atomic.Int32
 	stopCalls    atomic.Int32
 	serveCalls   atomic.Int32
+	memoryBytes  atomic.Uint64
 	stopTimeouts []time.Duration
 
 	// onStop, when non-nil, is invoked at the start of every Stop call.
@@ -283,6 +284,10 @@ func (f *fakeProcess) WaitReady(ctx context.Context) error {
 }
 
 func (f *fakeProcess) Logger() *logmon.Monitor { return logmon.NewWriter(io.Discard) }
+
+func (f *fakeProcess) ResidentMemoryBytes(context.Context) (uint64, error) {
+	return f.memoryBytes.Load(), nil
+}
 
 func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	f.serveCalls.Add(1)

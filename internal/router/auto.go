@@ -16,16 +16,17 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
-	"github.com/shirou/gopsutil/v4/mem"
 )
 
 // Auto uses one configured memory pool to keep models resident until the next
 // start requires evictions. A configured model memory value is authoritative.
-// On Apple Silicon, an omitted value is learned from an isolated start and
-// persisted in the configured SQLite store for subsequent launches.
+// On Apple Silicon, an omitted value is learned from the model's OS process
+// tree after an isolated first request and persisted for subsequent launches.
 type Auto struct {
 	*baseRouter
 }
+
+const memoryObservationVersion = "process-tree-rss-v1"
 
 func NewAuto(conf config.Config, proxylog, upstreamlog *logmon.Monitor, st *store.Store) (*Auto, error) {
 	if st == nil {
@@ -39,7 +40,7 @@ func NewAuto(conf config.Config, proxylog, upstreamlog *logmon.Monitor, st *stor
 		}
 	}
 
-	swapper, err := newAutoSwapper(conf, proxylog, st, appleUnifiedUsedBytes)
+	swapper, err := newAutoSwapper(conf, proxylog, st)
 	if err != nil {
 		return nil, err
 	}
@@ -62,16 +63,15 @@ func NewAuto(conf config.Config, proxylog, upstreamlog *logmon.Monitor, st *stor
 	r := &Auto{baseRouter: base}
 	go base.run()
 	if runtime.GOOS == "darwin" {
-		go r.observeIsolatedMemory(swapper)
+		go r.observeProcessMemoryHighWater()
 	}
 	return r, nil
 }
 
-// observeIsolatedMemory lets an isolated model's profile grow when later work
-// allocates more unified memory than it did at readiness. It deliberately does
-// nothing while two models are resident: an aggregate unified-memory increase
-// cannot be truthfully attributed to either model in that state.
-func (r *Auto) observeIsolatedMemory(swapper *autoSwapper) {
+// observeProcessMemoryHighWater periodically refreshes each ready model's own
+// process-tree measurement. Because observations are attributable by process,
+// every resident model can be sampled even while other engines are running.
+func (r *Auto) observeProcessMemoryHighWater() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -80,35 +80,33 @@ func (r *Auto) observeIsolatedMemory(swapper *autoSwapper) {
 			return
 		case <-ticker.C:
 			running := r.RunningModels()
-			if len(running) != 1 {
-				continue
-			}
-			for modelID := range running {
-				swapper.observeIsolated(modelID)
+			for modelID, state := range running {
+				if state == process.StateReady {
+					r.observeProcessMemory(modelID, r.processes[modelID])
+				}
 			}
 		}
 	}
 }
 
 // autoSwapper is intentionally a small online admission policy, not a general
-// placement solver. Its mutable measurements are protected because BeforeStart
-// runs in swap goroutines while scheduler lifecycle notifications run in the
-// base router's event loop.
+// placement solver. Its mutable measurements are protected because process
+// observations run in serving and periodic-observer goroutines while scheduler
+// lifecycle notifications run in the base router's event loop.
 type autoSwapper struct {
 	conf     config.Config
 	logger   *logmon.Monitor
 	store    *store.Store
-	sample   func() (uint64, error)
 	capacity uint64
 
 	mu           sync.Mutex
+	profileMu    sync.Mutex
 	profiles     map[string]uint64
-	baselines    map[string]uint64
 	loadDuration map[string]time.Duration
 	lastUse      map[string]time.Time
 }
 
-func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st *store.Store, sample func() (uint64, error)) (*autoSwapper, error) {
+func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st *store.Store) (*autoSwapper, error) {
 	settings := conf.Routing.Router.Settings.Auto
 	if settings == nil || settings.Capacity <= settings.Reserve {
 		return nil, fmt.Errorf("auto router requires a positive usable capacity")
@@ -117,10 +115,8 @@ func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st *store.Store,
 		conf:         conf,
 		logger:       logger,
 		store:        st,
-		sample:       sample,
 		capacity:     uint64(settings.Capacity - settings.Reserve),
 		profiles:     make(map[string]uint64),
-		baselines:    make(map[string]uint64),
 		loadDuration: make(map[string]time.Duration),
 		lastUse:      make(map[string]time.Time),
 	}
@@ -220,69 +216,51 @@ func (p *autoSwapper) OnSwapStart(target string, running []string) {
 	}
 }
 
-// BeforeStart records the unified-memory baseline only for a model that has
-// neither an explicit reservation nor a persisted profile. The base router
-// invokes it after its evictions have completed, preserving attribution.
-func (p *autoSwapper) BeforeStart(modelID string) {
-	p.mu.Lock()
-	_, known := p.reservationLocked(modelID)
-	p.mu.Unlock()
-	if known || runtime.GOOS != "darwin" || p.sample == nil {
-		return
-	}
-	used, err := p.sample()
-	if err != nil {
-		if p.logger != nil {
-			p.logger.Warnf("auto: sampling unified memory before %s: %v", modelID, err)
-		}
-		return
-	}
-	p.mu.Lock()
-	p.baselines[modelID] = used
-	p.mu.Unlock()
-}
-
 func (p *autoSwapper) OnSwapDone(ev scheduler.SwapDone) {
 	p.mu.Lock()
 	p.loadDuration[ev.ModelID] = ev.LoadDuration
 	p.mu.Unlock()
-	if ev.Err != nil {
-		return
-	}
-	p.observeIsolated(ev.ModelID)
 }
 
-// observeIsolated raises the learned high-water mark for a model only when its
-// BeforeStart baseline exists. The caller is responsible for ensuring no other
-// managed model is resident when this runs.
-func (p *autoSwapper) observeIsolated(modelID string) {
+func (p *autoSwapper) MemoryObservationMode(modelID string) (observe, synchronous bool) {
 	p.mu.Lock()
-	baseline, calibrating := p.baselines[modelID]
-	p.mu.Unlock()
-	if !calibrating || p.sample == nil {
+	defer p.mu.Unlock()
+	model, found := p.conf.Models[modelID]
+	if !found || model.Memory != 0 {
+		return false, false
+	}
+	_, profiled := p.profiles[modelID]
+	return true, !profiled
+}
+
+// OnMemoryObserved records an OS-attributed process-tree RSS high-water mark.
+// It may run concurrently from serving and periodic-observer goroutines, so
+// profileMu serializes persistence and prevents an older, smaller observation
+// from winning an out-of-order database write.
+func (p *autoSwapper) OnMemoryObserved(modelID string, observed uint64, sampleErr error) {
+	model, found := p.conf.Models[modelID]
+	if !found || model.Memory != 0 {
 		return
 	}
-	used, err := p.sample()
-	if err != nil {
+	if sampleErr != nil {
 		if p.logger != nil {
-			p.logger.Debugf("auto: sampling unified memory for %s: %v", modelID, err)
+			p.logger.Debugf("auto: sampling process-tree memory for %s: %v", modelID, sampleErr)
 		}
 		return
 	}
-	if used <= baseline {
-		if p.logger != nil {
-			p.logger.Debugf("auto: no positive isolated memory observation for %s", modelID)
-		}
+	if observed == 0 {
 		return
 	}
-	observed := used - baseline
+
+	p.profileMu.Lock()
+	defer p.profileMu.Unlock()
 	p.mu.Lock()
 	previous := p.profiles[modelID]
 	p.mu.Unlock()
 	if observed <= previous {
 		return
 	}
-	model := p.conf.Models[modelID]
+
 	profile := store.MemoryProfile{
 		ModelID:       modelID,
 		Fingerprint:   memoryProfileFingerprint(modelID, model),
@@ -291,7 +269,7 @@ func (p *autoSwapper) observeIsolated(modelID string) {
 	}
 	if err := p.store.SaveMemoryProfile(context.Background(), profile); err != nil {
 		if p.logger != nil {
-			p.logger.Warnf("auto: saving memory profile for %s: %v", modelID, err)
+			p.logger.Warnf("auto: saving process-tree memory profile for %s: %v", modelID, err)
 		}
 		return
 	}
@@ -368,26 +346,16 @@ func (p *autoSwapper) moreEvictableLocked(a, b string, now time.Time) bool {
 
 func memoryProfileFingerprint(modelID string, model config.ModelConfig) string {
 	encoded, _ := json.Marshal(struct {
-		ID               string
-		Cmd              string
-		CmdStop          string
-		Env              []string
-		Proxy            string
-		ConcurrencyLimit int
-	}{modelID, model.Cmd, model.CmdStop, model.Env, model.Proxy, model.ConcurrencyLimit})
+		ObservationVersion string
+		ID                 string
+		Cmd                string
+		CmdStop            string
+		Env                []string
+		Proxy              string
+		ConcurrencyLimit   int
+	}{memoryObservationVersion, modelID, model.Cmd, model.CmdStop, model.Env, model.Proxy, model.ConcurrencyLimit})
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
-}
-
-func appleUnifiedUsedBytes() (uint64, error) {
-	if runtime.GOOS != "darwin" {
-		return 0, fmt.Errorf("unified-memory calibration is only available on darwin")
-	}
-	stat, err := mem.VirtualMemory()
-	if err != nil {
-		return 0, err
-	}
-	return stat.Used, nil
 }
 
 func sortedCopy(ids []string) []string {

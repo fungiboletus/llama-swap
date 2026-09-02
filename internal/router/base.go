@@ -27,6 +27,8 @@ type unloadReq struct {
 	respond chan struct{}
 }
 
+const processMemoryObservationTimeout = 2 * time.Second
+
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
 // scheduler.Swapper describing how eviction sets are decided. baseRouter
@@ -69,6 +71,10 @@ type baseRouter struct {
 	// events are intentionally NOT signalled here so test event counts
 	// remain stable.
 	testProcessed chan struct{}
+
+	memoryMu       sync.Mutex
+	memorySampling map[string]bool
+	memoryPending  map[string]bool
 }
 
 func newBaseRouter(
@@ -81,22 +87,24 @@ func newBaseRouter(
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	procCtx, procCancel := context.WithCancel(context.Background())
 	b := &baseRouter{
-		name:        name,
-		config:      conf,
-		processes:   processes,
-		logger:      logger,
-		planner:     planner,
-		shutdownCtx: shutdownCtx,
-		shutdownFn:  shutdownFn,
-		procCtx:     procCtx,
-		procCancel:  procCancel,
-		handlerCh:   make(chan scheduler.HandlerReq),
-		cancelCh:    make(chan scheduler.HandlerReq),
-		shutdownCh:  make(chan shutdownReq),
-		unloadCh:    make(chan unloadReq),
-		swapDoneCh:  make(chan scheduler.SwapDone),
-		serveDoneCh: make(chan scheduler.ServeDoneEvent),
-		runDone:     make(chan struct{}),
+		name:           name,
+		config:         conf,
+		processes:      processes,
+		logger:         logger,
+		planner:        planner,
+		shutdownCtx:    shutdownCtx,
+		shutdownFn:     shutdownFn,
+		procCtx:        procCtx,
+		procCancel:     procCancel,
+		handlerCh:      make(chan scheduler.HandlerReq),
+		cancelCh:       make(chan scheduler.HandlerReq),
+		shutdownCh:     make(chan shutdownReq),
+		unloadCh:       make(chan unloadReq),
+		swapDoneCh:     make(chan scheduler.SwapDone),
+		serveDoneCh:    make(chan scheduler.ServeDoneEvent),
+		runDone:        make(chan struct{}),
+		memorySampling: make(map[string]bool),
+		memoryPending:  make(map[string]bool),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -233,6 +241,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 func (b *baseRouter) trackedServe(modelID string, p process.Process) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
+			b.observeProcessMemoryAfterServe(modelID, p)
 			select {
 			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID}:
 			case <-b.shutdownCtx.Done():
@@ -240,6 +249,72 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 		}()
 		p.ServeHTTP(w, r)
 	}
+}
+
+func (b *baseRouter) observeProcessMemoryAfterServe(modelID string, p process.Process) {
+	observer, ok := b.planner.(scheduler.MemoryObserver)
+	if !ok {
+		return
+	}
+	observe, synchronous := observer.MemoryObservationMode(modelID)
+	if !observe {
+		return
+	}
+	if synchronous {
+		b.observeProcessMemory(modelID, p)
+		return
+	}
+	b.queueProcessMemoryObservation(modelID, p)
+}
+
+// queueProcessMemoryObservation coalesces repeated request completions for one
+// model. At most one sampling goroutine runs per model, with one pending retry
+// retained when another completion arrives during the observation.
+func (b *baseRouter) queueProcessMemoryObservation(modelID string, p process.Process) {
+	b.memoryMu.Lock()
+	if b.memorySampling[modelID] {
+		b.memoryPending[modelID] = true
+		b.memoryMu.Unlock()
+		return
+	}
+	b.memorySampling[modelID] = true
+	b.memoryMu.Unlock()
+
+	go func() {
+		for {
+			b.observeProcessMemory(modelID, p)
+			b.memoryMu.Lock()
+			if b.memoryPending[modelID] && b.shutdownCtx.Err() == nil {
+				delete(b.memoryPending, modelID)
+				b.memoryMu.Unlock()
+				continue
+			}
+			delete(b.memoryPending, modelID)
+			delete(b.memorySampling, modelID)
+			b.memoryMu.Unlock()
+			return
+		}
+	}()
+}
+
+// observeProcessMemory performs one bounded OS process-tree query. The first
+// observation is called synchronously before ServeDone so an unprofiled model
+// remains protected from admission decisions; later calls run from the
+// periodic observer or the coalesced background worker above.
+func (b *baseRouter) observeProcessMemory(modelID string, p process.Process) {
+	observer, wantsMemory := b.planner.(scheduler.MemoryObserver)
+	reporter, canReport := p.(process.MemoryReporter)
+	if !wantsMemory || !canReport || b.shutdownCtx.Err() != nil {
+		return
+	}
+	observe, _ := observer.MemoryObservationMode(modelID)
+	if !observe {
+		return
+	}
+	ctx, cancel := context.WithTimeout(b.procCtx, processMemoryObservationTimeout)
+	defer cancel()
+	observed, err := reporter.ResidentMemoryBytes(ctx)
+	observer.OnMemoryObserved(modelID, observed, err)
 }
 
 func (b *baseRouter) doSwap(modelID string, toStop []string) {

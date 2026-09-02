@@ -137,6 +137,7 @@ type ProcessCommand struct {
 	// stores the active reverse-proxy handler when the process is running.
 	// Written only by run(); read by ServeHTTP via atomic load.
 	handler atomic.Pointer[http.HandlerFunc]
+	pid     atomic.Int64
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
@@ -187,6 +188,9 @@ func (p *ProcessCommand) run() {
 	setState := func(s ProcessState) {
 		old := state
 		state = s
+		if s != StateReady {
+			p.pid.Store(0)
+		}
 		p.state.Store(s)
 		if old != s {
 			event.Emit(swaputil.ProcessStateChangeEvent{
@@ -338,6 +342,7 @@ func (p *ProcessCommand) run() {
 					cmdCancel = res.cancel
 					fn := res.handlerFn
 					p.handler.Store(&fn)
+					p.pid.Store(int64(cmd.Process.Pid))
 					setState(StateReady)
 					notifyWaiters(nil)
 					if req.block {

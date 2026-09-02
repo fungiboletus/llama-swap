@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,6 +27,19 @@ const (
 	testPollInterval    = 20 * time.Millisecond
 	testLogPollInterval = 10 * time.Millisecond
 )
+
+func TestProcessCommand_ResidentMemoryBytesUsesActiveProcessTree(t *testing.T) {
+	p := &ProcessCommand{id: "memory-test"}
+	p.pid.Store(int64(os.Getpid()))
+
+	observed, err := p.ResidentMemoryBytes(t.Context())
+	if err != nil {
+		t.Fatalf("ResidentMemoryBytes: %v", err)
+	}
+	if observed == 0 {
+		t.Fatal("ResidentMemoryBytes returned zero for the test process")
+	}
+}
 
 func newProcessCommand(t *testing.T, conf config.ModelConfig) *ProcessCommand {
 	t.Helper()

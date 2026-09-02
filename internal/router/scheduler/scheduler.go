@@ -59,6 +59,16 @@ type ServeDoneObserver interface {
 	OnServeDone(modelID string)
 }
 
+// MemoryObserver is implemented by policies that learn per-model resident
+// memory. baseRouter performs the OS query outside the scheduler's single event
+// loop and reports the attributable result through this interface.
+type MemoryObserver interface {
+	// MemoryObservationMode reports whether modelID should be sampled and
+	// whether the observation must finish before the scheduler sees ServeDone.
+	MemoryObservationMode(modelID string) (observe, synchronous bool)
+	OnMemoryObserved(modelID string, observed uint64, err error)
+}
+
 // Scheduler decides what happens to each event the router's run loop receives.
 // All methods run on that single run-loop goroutine, so implementations need no
 // internal locking for their own state.

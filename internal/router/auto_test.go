@@ -13,7 +13,6 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +36,7 @@ func newTestAuto(t *testing.T, conf config.Config, processes map[string]process.
 	st, err := store.New("")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	swapper, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, func() (uint64, error) { return 0, nil })
+	swapper, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 	base, err := newBaseRouter("auto", conf, processes, logmon.NewWriter(io.Discard), swapper)
 	require.NoError(t, err)
@@ -61,7 +60,7 @@ func TestAutoSwapper_FitAndDeterministicEviction(t *testing.T) {
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 
 	assert.Empty(t, p.EvictionFor("b", []string{"a"}), "4 + 4 fits")
@@ -78,7 +77,7 @@ func TestAutoSwapper_PrefersLongerIdleAndCheaperLoad(t *testing.T) {
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 	p.lastUse["old"] = time.Now().Add(-10 * time.Minute)
 	p.lastUse["busy"] = time.Now().Add(-time.Minute)
@@ -97,7 +96,7 @@ func TestAutoSwapper_PrefersOrdinaryModelsOverKeepResidentModels(t *testing.T) {
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 
 	// The ordinary model is more recently used, but it remains the first
@@ -115,7 +114,7 @@ func TestAutoSwapper_EvictsKeepResidentModelWhenCapacityRequiresIt(t *testing.T)
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"preferred"}, p.EvictionFor("next", []string{"preferred"}))
@@ -130,35 +129,73 @@ func TestAutoSwapper_LogsPreferredEviction(t *testing.T) {
 	require.NoError(t, err)
 	defer st.Close()
 	var logs bytes.Buffer
-	p, err := newAutoSwapper(conf, logmon.NewWriter(&logs), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(&logs), st)
 	require.NoError(t, err)
 
 	p.OnSwapStart("next", []string{"preferred"})
 	assert.Contains(t, logs.String(), "evicting keep-resident model(s)=[preferred] for target=next reason=capacity required eviction")
 }
 
-func TestAutoSwapper_UnprofiledModelCalibratesAloneAndPersists(t *testing.T) {
+func TestAutoSwapper_ProcessTreeObservationPersistsHighWater(t *testing.T) {
 	conf := autoConfig(map[string]config.ModelConfig{"model": {}}, 100)
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	samples := []uint64{100, 140}
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, func() (uint64, error) {
-		value := samples[0]
-		samples = samples[1:]
-		return value, nil
-	})
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"a", "b"}, p.EvictionFor("model", []string{"b", "a"}))
-	p.BeforeStart("model")
-	p.OnSwapDone(scheduler.SwapDone{ModelID: "model", LoadDuration: time.Second})
+	p.OnMemoryObserved("model", 40, nil)
+	p.OnMemoryObserved("model", 30, nil)
 	assert.Empty(t, p.EvictionFor("model", nil), "calibrated model fits with its learned reservation")
 
 	profile, found, err := st.LoadMemoryProfile(context.Background(), "model", memoryProfileFingerprint("model", conf.Models["model"]))
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, uint64(40), profile.ObservedBytes)
+}
+
+func TestAutoSwapper_ProcessTreeObservationsRemainPerModel(t *testing.T) {
+	conf := autoConfig(map[string]config.ModelConfig{"a": {}, "b": {}}, 100)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
+	require.NoError(t, err)
+
+	p.OnMemoryObserved("a", 40, nil)
+	p.OnMemoryObserved("b", 30, nil)
+
+	assert.Equal(t, uint64(40), p.profiles["a"])
+	assert.Equal(t, uint64(30), p.profiles["b"])
+	assert.Empty(t, p.EvictionFor("b", []string{"a"}), "attributed profiles allow both models to remain resident")
+}
+
+func TestAuto_FirstRequestsCalibrateAloneThenModelsRunConcurrently(t *testing.T) {
+	a := newFakeProcess("a")
+	a.autoReady = true
+	a.memoryBytes.Store(40)
+	b := newFakeProcess("b")
+	b.autoReady = true
+	b.memoryBytes.Store(30)
+	conf := autoConfig(map[string]config.ModelConfig{"a": {}, "b": {}}, 100)
+	r, swapper := newTestAuto(t, conf, map[string]process.Process{"a": a, "b": b})
+
+	serve := func(modelID string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, newRequest(modelID))
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	}
+
+	serve("a")
+	serve("b")
+	require.Equal(t, int32(1), a.stopCalls.Load(), "unknown b must calibrate without a resident")
+	serve("a")
+
+	assert.Equal(t, uint64(40), swapper.profiles["a"])
+	assert.Equal(t, uint64(30), swapper.profiles["b"])
+	assert.Equal(t, int32(0), b.stopCalls.Load(), "known a and b fit and must remain concurrent")
 }
 
 func TestAuto_ServesTwoResidentModelsThenEvictsOne(t *testing.T) {
@@ -245,7 +282,7 @@ func BenchmarkAutoSwapper_EvictionFor500Models(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer st.Close()
-	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -267,7 +304,7 @@ func TestAutoSwapper_500ModelsRegressionGuard(t *testing.T) {
 	st, err := store.New("")
 	require.NoError(t, err)
 	defer st.Close()
-	p, err := newAutoSwapper(autoConfig(models, 500), logmon.NewWriter(io.Discard), st, nil)
+	p, err := newAutoSwapper(autoConfig(models, 500), logmon.NewWriter(io.Discard), st)
 	require.NoError(t, err)
 
 	started := time.Now()

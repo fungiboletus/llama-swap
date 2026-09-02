@@ -68,3 +68,11 @@ type Process interface {
 	// Logger returns the monitor that captures this process's stdout/stderr.
 	Logger() *logmon.Monitor
 }
+
+// MemoryReporter is implemented by processes whose resident memory can be
+// attributed to their own OS process tree. Routers use it as an optional
+// capability so fake or externally managed Process implementations do not
+// need to manufacture a measurement.
+type MemoryReporter interface {
+	ResidentMemoryBytes(context.Context) (uint64, error)
+}

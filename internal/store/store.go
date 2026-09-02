@@ -127,9 +127,9 @@ type Store struct {
 	inMemory bool
 }
 
-// MemoryProfile is an isolated, conservative memory observation for one
-// deployed model configuration. Fingerprint changes whenever the launcher
-// configuration used to create the observation changes.
+// MemoryProfile is a conservative OS-attributed memory observation for one
+// deployed model configuration. Fingerprint changes whenever the launcher or
+// observation method used to create the profile changes.
 type MemoryProfile struct {
 	ModelID       string
 	Fingerprint   string
