@@ -16,6 +16,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/ollamaapi"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -105,11 +106,15 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(ollamaapi.TagsResponse{Models: models})
 }
 
-// handleOllamaPS reports ready local processes only. A configured reservation
-// is a capacity-planning input, not measured resident memory; no per-model
-// CPU/GPU split or expiry is available from the local router.
+// handleOllamaPS reports ready local processes only. Size is the effective
+// capacity reservation used by the router, whether configured or calibrated;
+// no per-model CPU/GPU split or expiry is available from the local router.
 func (s *Server) handleOllamaPS(w http.ResponseWriter, _ *http.Request) {
 	states := s.local.RunningModels()
+	reservations := map[string]router.ResidencyInfo(nil)
+	if reporter, ok := s.local.(router.ResidencyReporter); ok {
+		reservations = reporter.ResidencyInfo()
+	}
 	models := make([]ollamaapi.ProcessModel, 0, len(states))
 	for modelID, state := range states {
 		if state != process.StateReady {
@@ -119,10 +124,14 @@ func (s *Server) handleOllamaPS(w http.ResponseWriter, _ *http.Request) {
 		if !found {
 			continue
 		}
+		size := uint64(model.Memory)
+		if reservation, ok := reservations[modelID]; ok {
+			size = reservation.Bytes
+		}
 		models = append(models, ollamaapi.ProcessModel{
 			Name:          modelID,
 			Model:         modelID,
-			Size:          int64(model.Memory),
+			Size:          int64(size),
 			Digest:        unknownOllamaDigest,
 			Details:       struct{}{},
 			ExpiresAt:     time.Now().Add(ollamaNoExpiryDuration),

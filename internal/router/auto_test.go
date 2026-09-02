@@ -171,6 +171,50 @@ func TestAutoSwapper_ProcessTreeObservationsRemainPerModel(t *testing.T) {
 	assert.Empty(t, p.EvictionFor("b", []string{"a"}), "attributed profiles allow both models to remain resident")
 }
 
+func TestAutoSwapper_PersistedProfilesPreserveConcurrencyAfterRestart(t *testing.T) {
+	conf := autoConfig(map[string]config.ModelConfig{"a": {}, "b": {}}, 100)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	first, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
+	require.NoError(t, err)
+	first.OnMemoryObserved("a", 40, nil)
+	first.OnMemoryObserved("b", 30, nil)
+
+	restarted, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
+	require.NoError(t, err)
+	assert.Empty(t, restarted.EvictionFor("b", []string{"a"}), "40 + 30 fits after profiles are reloaded")
+}
+
+func TestAutoSwapper_ExplicitDS4ReservationsRemainMutuallyExclusive(t *testing.T) {
+	const gib = uint64(1 << 30)
+	conf := autoConfig(map[string]config.ModelConfig{
+		"deepseek-v4-flash": {Memory: config.ByteSize(180 * gib)},
+		"glm-5.3-flash":     {Memory: config.ByteSize(190 * gib)},
+		"ordinary":          {Memory: config.ByteSize(16 * gib)},
+	}, 208*gib)
+	st, err := store.New("")
+	require.NoError(t, err)
+	defer st.Close()
+	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"deepseek-v4-flash"}, p.EvictionFor("glm-5.3-flash", []string{"deepseek-v4-flash", "ordinary"}), "the smaller model is redundant and must remain resident")
+	assert.Empty(t, p.EvictionFor("ordinary", []string{"glm-5.3-flash"}), "190 GiB + 16 GiB fits in the 208 GiB pool")
+}
+
+func TestAutoSwapper_MemoryProfileFingerprintIncludesContextConfiguration(t *testing.T) {
+	direct := config.ModelConfig{Cmd: "model-server --ctx 32768"}
+	largerDirect := direct
+	largerDirect.Cmd = "model-server --ctx 131072"
+	ollama := config.ModelConfig{Cmd: "ollama serve", Env: []string{"OLLAMA_CONTEXT_LENGTH=32768"}}
+	largerOllama := ollama
+	largerOllama.Env = []string{"OLLAMA_CONTEXT_LENGTH=131072"}
+
+	assert.NotEqual(t, memoryProfileFingerprint("model", direct), memoryProfileFingerprint("model", largerDirect))
+	assert.NotEqual(t, memoryProfileFingerprint("model", ollama), memoryProfileFingerprint("model", largerOllama))
+}
+
 func TestAuto_FirstRequestsCalibrateAloneThenModelsRunConcurrently(t *testing.T) {
 	a := newFakeProcess("a")
 	a.autoReady = true

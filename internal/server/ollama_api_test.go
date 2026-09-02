@@ -12,6 +12,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/ollamaapi"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router"
 )
 
 func newOllamaAPITestServer(t *testing.T, cfg config.Config, local *stubRouter) *Server {
@@ -110,6 +111,9 @@ models:
 		t.Fatalf("load config: %v", err)
 	}
 	local := newStubRouter([]string{"alpha", "zeta", "not-ready"}, "")
+	local.residency = map[string]router.ResidencyInfo{
+		"zeta": {Bytes: 9_426_059_264, Source: "calibrated"},
+	}
 	s := newOllamaAPITestServer(t, cfg, local)
 
 	assertPS := func(want string) {
@@ -145,7 +149,7 @@ models:
 		if alpha.Name != "alpha" || alpha.Model != "alpha" || alpha.Size != 2<<30 || alpha.SizeVRAM != 0 || alpha.ContextLength != 4096 || alpha.Digest != unknownOllamaDigest {
 			t.Errorf("alpha = %#v", alpha)
 		}
-		if zeta.Name != "zeta" || zeta.Model != "zeta" || zeta.Size != 0 || zeta.SizeVRAM != 0 || zeta.ContextLength != 0 || zeta.Digest != unknownOllamaDigest {
+		if zeta.Name != "zeta" || zeta.Model != "zeta" || zeta.Size != 9_426_059_264 || zeta.SizeVRAM != 0 || zeta.ContextLength != 0 || zeta.Digest != unknownOllamaDigest {
 			t.Errorf("zeta = %#v", zeta)
 		}
 		if alpha.ExpiresAt.Before(time.Now().Add(20*365*24*time.Hour)) || zeta.ExpiresAt.Before(time.Now().Add(20*365*24*time.Hour)) {

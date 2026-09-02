@@ -8,9 +8,8 @@ import (
 )
 
 // ResidentMemoryBytes reports the current resident-set size of the launched
-// command and all of its descendants. Descendants matter for launchers such as
-// Ollama, which keep the API server in the root process and run the model in a
-// child process.
+// command and all of its descendants. Descendants matter for launchers that
+// keep an API server in the root process and run the model in a child process.
 func (p *ProcessCommand) ResidentMemoryBytes(ctx context.Context) (uint64, error) {
 	pid := p.pid.Load()
 	if pid <= 0 {

@@ -162,12 +162,21 @@ On Apple Silicon, a model with no `memory` override serves its first request by
 itself. The auto router then records the resident-set size of that model's OS
 process tree, including child inference processes, and keeps a 30-second
 high-water observation while it remains loaded. Measurements stay attributable
-to their owning model even when several engines share the pool, and a learned
-value is never lowered. The resulting profile is keyed to the deployed
-command/configuration and observation-method fingerprint and is persisted in
-the SQLite `store.path`; configure a file-backed store to retain it across
-restarts. `GET /api/residency` labels each reservation as `configured`,
-`calibrated`, or `unprofiled`.
+to their owning model even when several engines share the pool, so ordinary
+models retain normal cross-model concurrency and no restart is needed after
+calibration.
+
+The profile fingerprint includes the deployed command, environment, and
+concurrency. Context configured in a command such as `--ctx` or an environment
+variable such as `OLLAMA_CONTEXT_LENGTH` therefore forces a fresh calibration.
+Automatic process measurement cannot account reliably for engines whose model
+weights remain in large file mappings or opaque Metal allocations. Give those
+engines an explicit conservative `memory` value that includes weights, maximum
+production context, backend allocations, and parallelism.
+
+Profiles are persisted in the SQLite `store.path`; configure a file-backed
+store to retain them across restarts. `GET /api/residency` labels each
+reservation as `configured`, `calibrated`, or `unprofiled`.
 
 On non-Apple hosts, automatic calibration is unavailable in this release, so
 auto-routing configurations must provide `memory` for every model. This keeps

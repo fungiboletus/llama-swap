@@ -21,7 +21,7 @@ import (
 // Auto uses one configured memory pool to keep models resident until the next
 // start requires evictions. A configured model memory value is authoritative.
 // On Apple Silicon, an omitted value is learned from the model's OS process
-// tree after an isolated first request and persisted for subsequent launches.
+// tree after its first request and persisted for subsequent launches.
 type Auto struct {
 	*baseRouter
 }
@@ -151,12 +151,14 @@ func (p *autoSwapper) EvictionFor(target string, running []string) []string {
 	}
 
 	used := uint64(0)
+	allKnown := true
 	for _, id := range running {
 		bytes, known := p.reservationLocked(id)
 		if !known {
 			// An in-flight first calibration is conservatively treated as using
 			// the whole pool until it reports a profile.
 			used = p.capacity
+			allKnown = false
 			break
 		}
 		used += bytes
@@ -166,6 +168,7 @@ func (p *autoSwapper) EvictionFor(target string, running []string) []string {
 	}
 
 	candidates := sortedCopy(running)
+	originalUsed := used
 	now := time.Now()
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return p.moreEvictableLocked(candidates[i], candidates[j], now)
@@ -180,10 +183,47 @@ func (p *autoSwapper) EvictionFor(target string, running []string) []string {
 			used -= bytes
 		}
 		if targetBytes <= p.capacity-used {
+			if allKnown {
+				result = p.pruneRedundantEvictionsLocked(result, originalUsed, targetBytes)
+			}
 			return result
 		}
 	}
 	// Configuration validation guarantees an individually known target fits.
+	return result
+}
+
+// pruneRedundantEvictionsLocked removes models that a ranked-prefix decision
+// selected before a later, larger eviction made them unnecessary. Iterating in
+// reverse preserves the planner's preference order: less-evictable models are
+// kept in the eviction set only when capacity actually requires them.
+func (p *autoSwapper) pruneRedundantEvictionsLocked(selected []string, used, targetBytes uint64) []string {
+	remainingUsed := used
+	for _, id := range selected {
+		bytes, _ := p.reservationLocked(id)
+		if bytes >= remainingUsed {
+			remainingUsed = 0
+		} else {
+			remainingUsed -= bytes
+		}
+	}
+
+	keep := make([]bool, len(selected))
+	for i := len(selected) - 1; i >= 0; i-- {
+		bytes, _ := p.reservationLocked(selected[i])
+		if bytes <= p.capacity-remainingUsed && targetBytes <= p.capacity-(remainingUsed+bytes) {
+			remainingUsed += bytes
+			continue
+		}
+		keep[i] = true
+	}
+
+	result := make([]string, 0, len(selected))
+	for i, id := range selected {
+		if keep[i] {
+			result = append(result, id)
+		}
+	}
 	return result
 }
 

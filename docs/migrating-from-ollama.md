@@ -128,8 +128,9 @@ reserve host headroom. Prefer an explicit `memory` value that includes model
 weights, context/KV cache, backend allocations, and the configured request
 parallelism. On Apple unified memory, an omitted value is conservatively
 calibrated from the model's OS process tree after an isolated first request,
-then refreshed independently while other engines are resident. NVIDIA and ROCm
-deployments require explicit values.
+then refreshed independently while other engines are resident. Engines that
+use opaque Metal allocations or large file mappings still need an explicit
+value. NVIDIA and ROCm deployments require explicit values.
 
 The proxy log records each admission decision as `auto:` with target,
 reservation, used capacity, evictions, and reason. `GET /api/residency` shows
