@@ -51,9 +51,29 @@ type Server struct {
 	mux     *http.ServeMux
 	handler http.Handler
 
-	shutdownCtx  context.Context
-	shutdownFn   context.CancelFunc
-	shuttingDown atomic.Bool
+	shutdownCtx    context.Context
+	shutdownFn     context.CancelFunc
+	shuttingDown   atomic.Bool
+	tailcatAddress atomic.Pointer[string]
+}
+
+func (s *Server) SetTailcatAddress(address string) {
+	value := address
+	s.tailcatAddress.Store(&value)
+}
+
+func (s *Server) TailcatAddress() string {
+	if value := s.tailcatAddress.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+type tailcatRequestContextKey struct{}
+
+func isTailcatRequest(ctx context.Context) bool {
+	marked, _ := ctx.Value(tailcatRequestContextKey{}).(bool)
+	return marked
 }
 
 // ActiveProfile returns the active runtime profile, or an empty string when no
@@ -174,7 +194,7 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
 		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
 		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
-		"GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}",
+		"GET /api/tailcat", "GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}",
 		"/api/mcp":
 		return routeAdmin, true
 	default:
@@ -315,9 +335,7 @@ func stripVersionPrefix(r *http.Request) {
 // before forwarding upstream, so /audioapi/v1/tasks/run reaches the upstream
 // as /v1/tasks/run.
 func stripAudioAPIPrefix(r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/audioapi") {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/audioapi")
-	}
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/audioapi")
 }
 
 // routes builds the mux, registers every route, and wraps the mux with the
@@ -325,7 +343,16 @@ func stripAudioAPIPrefix(r *http.Request) {
 func (s *Server) routes() {
 	inferenceAuthMW := CreateInferenceAuthMiddleware(s.cfg)
 	adminAuthMW := CreateAdminAuthMiddleware(s.cfg)
-	modelChain := chain.New(
+	modelMWs := []chain.Middleware{inferenceAuthMW}
+	// globalConcurrencyLimit guards the top of the inference chain; a limit of
+	// 0 (the default) means no limit, so the handler is left out of the chain
+	// entirely rather than wrapping every request in a no-op semaphore.
+	var concurrencyMW chain.Middleware
+	if s.cfg.GlobalConcurrencyLimit > 0 {
+		concurrencyMW = CreateConcurrencyLimitMiddleware(s.cfg.GlobalConcurrencyLimit)
+		modelMWs = append(modelMWs, concurrencyMW)
+	}
+	modelMWs = append(modelMWs,
 		CreateProfileMiddleware(s),
 		CreateSelectorMiddleware(s),
 		CreateRequestContextMiddleware(s.cfg),
@@ -334,6 +361,7 @@ func (s *Server) routes() {
 		CreateFormFilterMiddleware(s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
+	modelChain := chain.New(modelMWs...)
 
 	mux := http.NewServeMux()
 	register := func(pattern string, handler http.Handler) {
@@ -343,6 +371,9 @@ func (s *Server) routes() {
 		}
 		switch access {
 		case routeInference:
+			if concurrencyMW != nil && (pattern == "POST /api/chat" || pattern == "POST /api/generate") {
+				handler = concurrencyMW(handler)
+			}
 			handler = inferenceAuthMW(handler)
 		case routeAdmin:
 			handler = adminAuthMW(handler)
@@ -423,6 +454,7 @@ func (s *Server) routes() {
 	register("GET /api/residency", http.HandlerFunc(s.handleAPIResidency))
 	register("GET /api/captures/{id}", http.HandlerFunc(s.handleAPICapture))
 	register("/api/mcp", http.HandlerFunc(s.handleAPIMCP))
+	register("GET /api/tailcat", http.HandlerFunc(s.handleAPITailcat))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
@@ -430,6 +462,92 @@ func (s *Server) routes() {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
+}
+
+// ServeTailcatHTTP applies Tailcat's deliberately narrow HTTP capability
+// surface before delegating to the normal, API-key-protected handler.
+func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
+	tc := s.cfg.Tailcat
+	if !s.cfg.TailcatEnabled() || tc == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	inference := isTailcatInferenceRequest(r)
+	if !tc.Admin {
+		allowed := r.Method == http.MethodGet && (r.URL.Path == "/health" || r.URL.Path == "/v1/models" || r.URL.Path == "/models")
+		if r.Method == http.MethodOptions {
+			allowed = isTailcatInferencePath(r.URL.Path)
+		}
+		if inference {
+			allowed = true
+		}
+		if !allowed {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if inference && r.Method != http.MethodOptions {
+		model, err := swaputil.ExtractModel(r)
+		if err != nil || !tailcatModelAllowed(tc.Models, model) {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	r = r.WithContext(context.WithValue(r.Context(), tailcatRequestContextKey{}, true))
+	s.handler.ServeHTTP(w, r)
+}
+
+func isTailcatInferenceRequest(r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		for _, path := range modelPostJSONRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+		for _, path := range modelPostFormRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	if r.Method == http.MethodGet {
+		for _, path := range modelGetRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isTailcatInferencePath(path string) bool {
+	for _, candidate := range modelPostJSONRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelPostFormRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelGetRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func tailcatModelAllowed(models []string, id string) bool {
+	for _, exposed := range models {
+		if exposed == "*" || exposed == id {
+			return true
+		}
+	}
+	return false
 }
 
 // CloseStreams cancels long-lived response streams (Server-Sent Events) so a

@@ -112,6 +112,8 @@ export function activityCellText(row: ActivityLogEntry, columnId: string): strin
       return row.model;
     case "authenticated_user":
       return row.authenticated_user || "-";
+    case "src":
+      return row.src || "-";
     case "req_path":
       return row.req_path || "-";
     case "resp_status_code":

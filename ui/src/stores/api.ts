@@ -15,6 +15,7 @@ import type {
   ProfileState,
   PlaygroundModelType,
   HardwareSnapshot,
+  TailcatStatus,
 } from "../lib/types";
 import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
 import { connectionState } from "./theme";
@@ -48,6 +49,7 @@ const defaultUIConfig = (): UIConfig => ({
 });
 export const uiConfig = writable<UIConfig>(defaultUIConfig());
 export const performanceEnabled = writable<boolean>(false);
+export const tailcatStatus = writable<TailcatStatus>({ enabled: false, address: "", models: [] });
 export const versionInfo = writable<VersionInfo>({
   build_date: "unknown",
   commit: "unknown",
@@ -111,6 +113,7 @@ export function enableAPIEvents(enabled: boolean): void {
       retryCount = 0;
       connectionState.set("connected");
       void fetchProfiles().catch((error) => console.error(error));
+      void fetchTailcatStatus().catch((error) => console.error(error));
     };
 
     apiEventSource.onmessage = (e: MessageEvent) => {
@@ -260,6 +263,7 @@ interface ModelListRecord {
   name?: string;
   description?: string;
   capabilities?: Model["capabilities"];
+  context_length?: number;
   meta?: {
     llamaswap?: {
       type?: PlaygroundModelType | "alias";
@@ -311,6 +315,7 @@ async function loadPlaygroundModels(request: number): Promise<Model[]> {
           playgroundType,
           aliases: [...(aliasesByModel.get(record.id) ?? [])],
           capabilities: record.capabilities,
+          context_length: record.context_length,
           strategy: metadata?.strategy,
           targets: metadata?.targets ?? [],
           spillover: metadata?.spillover,
@@ -353,6 +358,7 @@ export async function getActivity(params: {
   sort?: string;
   order?: "asc" | "desc";
   filters?: ActivityFilters;
+  srcPrefix?: string;
 } = {}): Promise<ActivityPage> {
   const query = new URLSearchParams();
   if (params.model) query.set("model", params.model);
@@ -360,6 +366,7 @@ export async function getActivity(params: {
   if (params.limit) query.set("limit", String(params.limit));
   if (params.sort) query.set("sort", params.sort);
   if (params.order) query.set("order", params.order);
+  if (params.srcPrefix) query.set("src_prefix", params.srcPrefix);
   // Drawer filters only ever add id bounds, so they never conflict with a
   // model pinned above. The API also accepts repeated "model" params and
   // start/end timestamps, which no UI control currently produces.
@@ -371,6 +378,16 @@ export async function getActivity(params: {
     throw new Error(`Failed to fetch activity: ${response.status}`);
   }
   return await response.json();
+}
+
+export async function fetchTailcatStatus(): Promise<TailcatStatus> {
+  const response = await fetch("/api/tailcat");
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Tailcat status: ${response.status}`);
+  }
+  const status = await response.json() as TailcatStatus;
+  tailcatStatus.set(status);
+  return status;
 }
 
 export async function getActivityStats(model?: string): Promise<ActivityStatsData> {

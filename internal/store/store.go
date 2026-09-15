@@ -45,16 +45,18 @@ type ActivityLogEntry struct {
 	HasCapture        bool              `json:"has_capture"`
 	ErrorMsg          string            `json:"error_msg,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
+	Src               string            `json:"src"`
 }
 
 // ActivityFilter narrows which activity rows a query matches. The zero value
 // matches every row, and each field is independent: set fields are ANDed.
 type ActivityFilter struct {
-	Models []string  // model_id IN (...); empty matches all models
-	Start  time.Time // inclusive lower bound on ts_created; zero is unbounded
-	End    time.Time // inclusive upper bound on ts_created; zero is unbounded
-	MinID  int       // inclusive lower bound on id; 0 is unbounded
-	MaxID  int       // inclusive upper bound on id; 0 is unbounded
+	Models    []string  // model_id IN (...); empty matches all models
+	Start     time.Time // inclusive lower bound on ts_created; zero is unbounded
+	End       time.Time // inclusive upper bound on ts_created; zero is unbounded
+	MinID     int       // inclusive lower bound on id; 0 is unbounded
+	MaxID     int       // inclusive upper bound on id; 0 is unbounded
+	SrcPrefix string    // literal source prefix; empty matches every source
 }
 
 type ActivityQuery struct {
@@ -72,6 +74,7 @@ var activitySortColumns = map[string]string{
 	"id":                "id",
 	"time":              "ts_created",
 	"model":             "model_id",
+	"src":               "src",
 	"req_path":          "req_path",
 	"resp_status_code":  "resp_status_code",
 	"resp_content_type": "resp_content_type",
@@ -261,12 +264,13 @@ func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (Act
 
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO activity (
-			ts_created, model_id, req_path, resp_content_type, resp_status_code,
+			ts_created, src, model_id, req_path, resp_content_type, resp_status_code,
 			authenticated_user,
 			cache_tokens, draft_tokens, draft_acc_tokens, input_tokens, output_tokens,
 			prompt_per_second, tokens_per_second, duration_ms, error_msg, metadata_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.Timestamp.Unix(),
+		entry.Src,
 		entry.Model,
 		entry.ReqPath,
 		entry.RespContentType,
@@ -306,7 +310,7 @@ func (s *Store) ListActivity(ctx context.Context, query ActivityQuery) (Activity
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT
-			id, ts_created, model_id, req_path, resp_content_type, resp_status_code,
+			id, ts_created, src, model_id, req_path, resp_content_type, resp_status_code,
 			authenticated_user,
 			cache_tokens, draft_tokens, draft_acc_tokens, input_tokens, output_tokens,
 			prompt_per_second, tokens_per_second, duration_ms, error_msg, metadata_json
@@ -552,6 +556,12 @@ func activityWhere(filter ActivityFilter) (string, []any) {
 		conditions = append(conditions, "id <= ?")
 		args = append(args, filter.MaxID)
 	}
+	if filter.SrcPrefix != "" {
+		// A bounded lexical range is a literal prefix match (SQL wildcard
+		// characters remain data) and can use idx_activity_src_created_id.
+		conditions = append(conditions, "src >= ? AND src < ?")
+		args = append(args, filter.SrcPrefix, filter.SrcPrefix+"\U0010FFFF")
+	}
 
 	if len(conditions) == 0 {
 		return "", nil
@@ -581,6 +591,7 @@ func scanActivity(scanner activityScanner) (ActivityLogEntry, error) {
 	if err := scanner.Scan(
 		&entry.ID,
 		&ts,
+		&entry.Src,
 		&entry.Model,
 		&entry.ReqPath,
 		&entry.RespContentType,

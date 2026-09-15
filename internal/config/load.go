@@ -101,6 +101,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.MaxTokens < 0 {
 		return Config{}, fmt.Errorf("maxTokens must be >= 0")
 	}
+	if config.GlobalConcurrencyLimit < 0 {
+		return Config{}, fmt.Errorf("globalConcurrencyLimit must be >= 0")
+	}
 
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
 
@@ -335,6 +338,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	if err := validateProfiles(config); err != nil {
+		return Config{}, err
+	}
+
+	if err := validateTailcatConfig(&config); err != nil {
 		return Config{}, err
 	}
 
