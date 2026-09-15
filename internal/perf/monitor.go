@@ -22,6 +22,10 @@ type Monitor struct {
 	conf    config.PerformanceConfig
 	sysRing ring.Buffer[SysStat]
 	gpuRing ring.Buffer[[]GpuStat]
+	sysDay  rollup[SysStat]
+	sysWeek rollup[SysStat]
+	gpuDay  rollup[[]GpuStat]
+	gpuWeek rollup[[]GpuStat]
 
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -49,14 +53,16 @@ func New(c config.PerformanceConfig, logger *logmon.Monitor) (*Monitor, error) {
 	}
 
 	capacity := ringCapacity(c)
-	return &Monitor{
+	m := &Monitor{
 		conf:         c,
 		log:          logger,
 		sysRing:      ring.NewBuffer[SysStat](capacity),
 		gpuRing:      ring.NewBuffer[[]GpuStat](capacity),
 		sysListeners: make(map[chan SysStat]struct{}),
 		gpuListeners: make(map[chan []GpuStat]struct{}),
-	}, nil
+	}
+	m.resetHistory()
+	return m, nil
 }
 
 func (m *Monitor) Stop() {
@@ -85,6 +91,7 @@ func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig) {
 	capacity := ringCapacity(newConf)
 	m.sysRing = ring.NewBuffer[SysStat](capacity)
 	m.gpuRing = ring.NewBuffer[[]GpuStat](capacity)
+	m.resetHistory()
 	m.mutex.Unlock()
 	if !newConf.Disabled {
 		m.Start()
@@ -119,13 +126,14 @@ func (m *Monitor) Start() {
 	}
 
 	m.stopCtx, m.stopCancel = context.WithCancel(context.Background())
+	ctx, every := m.stopCtx, m.conf.Every
 
 	go func() {
-		tick := time.NewTicker(m.conf.Every)
+		tick := time.NewTicker(every)
 		defer tick.Stop()
 		for {
 			select {
-			case <-m.stopCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-tick.C:
 				s, err := ReadSysStats()
@@ -136,7 +144,11 @@ func (m *Monitor) Start() {
 					continue
 				}
 				m.mutex.Lock()
-				m.sysRing.Push(s)
+				if ctx.Err() != nil {
+					m.mutex.Unlock()
+					return
+				}
+				m.recordSys(s)
 				for l := range m.sysListeners {
 					select {
 					case l <- s:
@@ -149,7 +161,7 @@ func (m *Monitor) Start() {
 	}()
 
 	go func() {
-		gpuCh, err := getGpuStats(m.stopCtx, m.conf.Every, m.log)
+		gpuCh, err := getGpuStats(ctx, every, m.log)
 		if err != nil {
 			if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrNoGpuTool) {
 				m.log.Infof("GPU monitoring not available: %s", err.Error())
@@ -161,7 +173,7 @@ func (m *Monitor) Start() {
 
 		for {
 			select {
-			case <-m.stopCtx.Done():
+			case <-ctx.Done():
 				return
 			case g, ok := <-gpuCh:
 				if !ok {
@@ -169,7 +181,11 @@ func (m *Monitor) Start() {
 					return
 				}
 				m.mutex.Lock()
-				m.gpuRing.Push(g)
+				if ctx.Err() != nil {
+					m.mutex.Unlock()
+					return
+				}
+				m.recordGPU(g)
 				for l := range m.gpuListeners {
 					select {
 					case l <- g:

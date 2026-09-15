@@ -311,3 +311,20 @@ describe("api store event handling", () => {
     await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
   });
 });
+
+describe("performance windows", () => {
+  it("fetches a full week snapshot without an incremental cursor", async () => {
+    const { fetchPerformance } = await import("./api");
+    const data = { sys_stats: [], gpu_stats: [], aggregation_seconds: 1800 };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => data }));
+    await expect(fetchPerformance(undefined, "7d")).resolves.toEqual(data);
+    expect(fetch).toHaveBeenCalledWith("/api/performance?window=7d");
+  });
+
+  it("preserves legacy raw-sample cursor requests", async () => {
+    const { fetchPerformance } = await import("./api");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    await fetchPerformance("2026-09-15T12:00:00Z");
+    expect(fetch).toHaveBeenCalledWith("/api/performance?after=2026-09-15T12%3A00%3A00Z");
+  });
+});

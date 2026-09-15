@@ -312,7 +312,9 @@ func parseActivityQuery(r *http.Request) (store.ActivityQuery, error) {
 }
 
 // handleAPIPerformance serves the buffered system/GPU stats, optionally
-// filtered to samples after the ?after=<RFC3339> timestamp.
+// filtered with ?window=5m|15m|1h|24h|7d. Day/week windows return
+// sample means in 5m/30m buckets; refresh the full snapshot as the current
+// bucket changes. The legacy ?after=<RFC3339> cursor supports raw samples only.
 func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	if s.perf == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -321,7 +323,31 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	window := time.Hour
+	aggregationSeconds := 0
+	rawWindow := r.URL.Query().Get("window")
+	switch rawWindow {
+	case "", "1h":
+	case "5m":
+		window = 5 * time.Minute
+	case "15m":
+		window = 15 * time.Minute
+	case "24h":
+		window, aggregationSeconds = 24*time.Hour, 300
+	case "7d":
+		window, aggregationSeconds = 7*24*time.Hour, 1800
+	default:
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid window: use 5m, 15m, 1h, 24h, or 7d")
+		return
+	}
+	if aggregationSeconds > 0 && r.URL.Query().Get("after") != "" {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "after is not supported for aggregated windows; refresh the full window")
+		return
+	}
 	sysStats, gpuStats := s.perf.Current()
+	if rawWindow != "" {
+		sysStats, gpuStats = s.perf.History(window, time.Now())
+	}
 
 	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
 		after, err := time.Parse(time.RFC3339, afterStr)
@@ -348,9 +374,10 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"enabled":   true,
-		"sys_stats": sysStats,
-		"gpu_stats": gpuStats,
+		"enabled":             true,
+		"aggregation_seconds": aggregationSeconds,
+		"sys_stats":           sysStats,
+		"gpu_stats":           gpuStats,
 	})
 }
 

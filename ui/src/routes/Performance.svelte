@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { WINDOWS, formatDelta, gpuTimestamps, gpuDatasets } from "../lib/performance";
   import { fetchPerformance } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import type { SysStat, GpuStat } from "../lib/types";
@@ -28,12 +29,6 @@
     "#22d3ee",
   ];
 
-  const WINDOWS = [
-    { label: "5 min", ms: 5 * 60 * 1000 },
-    { label: "15 min", ms: 15 * 60 * 1000 },
-    { label: "1 hr", ms: 60 * 60 * 1000 },
-  ] as const;
-
   const INTERVALS = [
     { label: "Off", ms: 0 },
     { label: "5s", ms: 5000 },
@@ -47,25 +42,16 @@
   let sysData = $state<SysStat[]>([]);
   let gpuData = $state<GpuStat[]>([]);
   let refreshing = $state(false);
+  let loadError = $state(false);
+  let requestID = 0;
+  const currentWindow = $derived(WINDOWS[$selectedWindow] ?? WINDOWS[0]);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let visible = $state(true);
   let mounted = $state(false);
 
   function cutoffTime(): number {
-    return Date.now() - WINDOWS[$selectedWindow].ms;
-  }
-
-  function formatDelta(ts: string, refTime: number): string {
-    const diffMs = new Date(ts).getTime() - refTime;
-    const diffSec = Math.round(diffMs / 1000);
-    const absSec = Math.abs(diffSec);
-    const sign = diffSec <= 0 ? "-" : "+";
-    if (absSec < 60) return `${sign}${absSec}s`;
-    const min = Math.floor(absSec / 60);
-    const sec = absSec % 60;
-    if (sec === 0) return `${sign}${min}m`;
-    return `${sign}${min}:${sec.toString().padStart(2, "0")}`;
+    return Date.now() - currentWindow.ms;
   }
 
   const sysLabels = $derived.by(() => {
@@ -76,35 +62,34 @@
   });
 
   async function loadAll() {
-    const resp = await fetchPerformance();
+    const id = ++requestID;
+    refreshing = true;
+    const resp = await fetchPerformance(undefined, currentWindow.value);
+    if (id !== requestID || !mounted) return;
+    refreshing = false;
+    loadError = !resp;
     if (resp) {
+      // Replace the snapshot: the unfinished average bucket changes on each poll.
       sysData = resp.sys_stats ?? [];
       gpuData = resp.gpu_stats ?? [];
     }
   }
 
-  async function loadIncremental() {
-    const lastTs = sysData.length > 0 ? sysData[sysData.length - 1].timestamp : undefined;
-    const resp = await fetchPerformance(lastTs);
-    if (resp) {
-      const newSys = resp.sys_stats ?? [];
-      const newGpu = resp.gpu_stats ?? [];
-      if (newSys.length > 0) {
-        sysData = [...sysData, ...newSys];
-      }
-      if (newGpu.length > 0) {
-        gpuData = [...gpuData, ...newGpu];
-      }
-    }
+  function handleWindowChange(i: number) {
+    $selectedWindow = i;
+    sysData = [];
+    gpuData = [];
+    void loadAll();
   }
 
   function startPolling() {
     stopPolling();
-    const ms = INTERVALS[$selectedInterval].ms;
+    if (!mounted || !visible) return;
+    const ms = (INTERVALS[$selectedInterval] ?? INTERVALS[0]).ms;
     if (ms <= 0) return;
     pollTimer = setInterval(() => {
-      if (visible) {
-        loadIncremental();
+      if (visible && !refreshing) {
+        void loadAll();
       }
     }, ms);
   }
@@ -133,9 +118,7 @@
   }
 
   async function manualRefresh() {
-    refreshing = true;
-    await loadIncremental();
-    refreshing = false;
+    await loadAll();
   }
 
   $effect(() => {
@@ -269,8 +252,8 @@
         }
 
         const dtSec = dtMs / 1000;
-        recvData.push((((currIO.bytes_recv - prevIO.bytes_recv) / dtSec) * 8) / 1_000_000);
-        sentData.push((((currIO.bytes_sent - prevIO.bytes_sent) / dtSec) * 8) / 1_000_000);
+        recvData.push(((Math.max(0, currIO.bytes_recv - prevIO.bytes_recv) / dtSec) * 8) / 1_000_000);
+        sentData.push(((Math.max(0, currIO.bytes_sent - prevIO.bytes_sent) / dtSec) * 8) / 1_000_000);
       }
 
       datasets.push({
@@ -304,61 +287,24 @@
   const hasGpuData = $derived(gpuData.length > 0);
 
   const gpuLabels = $derived.by(() => {
-    const seen = new Set<string>();
-    const labels: string[] = [];
-    const stats = filteredGpuStats;
-    if (stats.length === 0) return [];
-    const refTime = new Date(stats[stats.length - 1].timestamp).getTime();
-    for (const g of stats) {
-      const label = formatDelta(g.timestamp, refTime);
-      if (!seen.has(label)) {
-        seen.add(label);
-        labels.push(label);
-      }
-    }
-    return labels;
+    const timestamps = gpuTimestamps(filteredGpuStats);
+    const refTime = timestamps[timestamps.length - 1];
+    return timestamps.map((ts) => formatDelta(new Date(ts).toISOString(), refTime));
   });
 
-  function buildGpuDatasets(
-    stats: GpuStat[],
-    field: keyof Pick<GpuStat, "gpu_util_pct" | "mem_util_pct" | "temp_c" | "vram_temp_c" | "power_draw_w">,
-  ) {
-    if (stats.length === 0) return [];
-
-    const byId = new Map<number, { name: string; values: number[] }>();
-    for (const g of stats) {
-      if (!byId.has(g.id)) {
-        byId.set(g.id, { name: g.name, values: [] });
-      }
-      byId.get(g.id)!.values.push(g[field] as number);
-    }
-
-    const datasets = [];
-    let colorIdx = 0;
-    for (const [id, entry] of byId) {
-      datasets.push({
-        label: entry.name || `GPU ${id}`,
-        data: entry.values,
-        borderColor: COLORS[colorIdx % COLORS.length],
-      });
-      colorIdx++;
-    }
-    return datasets;
-  }
-
-  const gpuUtilDatasets = $derived(buildGpuDatasets(filteredGpuStats, "gpu_util_pct"));
-  const gpuMemDatasets = $derived(buildGpuDatasets(filteredGpuStats, "mem_util_pct"));
-  const gpuTempDatasets = $derived(buildGpuDatasets(filteredGpuStats, "temp_c"));
-  const gpuVramTempDatasets = $derived(buildGpuDatasets(filteredGpuStats, "vram_temp_c"));
-  const gpuPowerDatasets = $derived(buildGpuDatasets(filteredGpuStats, "power_draw_w"));
+  const gpuUtilDatasets = $derived(gpuDatasets(filteredGpuStats, "gpu_util_pct", COLORS));
+  const gpuMemDatasets = $derived(gpuDatasets(filteredGpuStats, "mem_util_pct", COLORS));
+  const gpuTempDatasets = $derived(gpuDatasets(filteredGpuStats, "temp_c", COLORS));
+  const gpuVramTempDatasets = $derived(gpuDatasets(filteredGpuStats, "vram_temp_c", COLORS));
+  const gpuPowerDatasets = $derived(gpuDatasets(filteredGpuStats, "power_draw_w", COLORS));
   const hasVramTemp = $derived(filteredGpuStats.some((g) => g.vram_temp_c > 0));
 </script>
 
 <div class="space-y-6">
-  <div class="flex items-center justify-between">
+  <div class="flex flex-wrap items-center justify-between gap-3">
     <h2 class="text-xl font-semibold text-foreground">Performance (Experimental)</h2>
-    <div class="flex items-center gap-4">
-      <SegmentedControl items={WINDOWS} selected={$selectedWindow} onSelect={(i) => ($selectedWindow = i)} />
+    <div class="flex flex-wrap items-center gap-4">
+      <SegmentedControl items={WINDOWS} selected={$selectedWindow} onSelect={handleWindowChange} />
       <SegmentedControl
         items={INTERVALS}
         selected={$selectedInterval}
@@ -376,6 +322,17 @@
       href="https://github.com/mostlygeek/llama-swap/discussions/771">discussion #771</a
     > for instructions and to share feedback.
   </p>
+
+  <p class="text-sm text-muted-foreground">
+    {#if currentWindow.value === "24h"}Five-minute averages.
+    {:else if currentWindow.value === "7d"}Thirty-minute averages.
+    {:else}Individual samples.{/if}
+    History accumulates while the server runs and resets on restart or performance configuration changes.
+    The newest average is still accumulating; network charts show average bandwidth between samples.
+  </p>
+  {#if loadError}
+    <p role="alert" class="text-sm text-destructive">Could not refresh performance data. Please try again.</p>
+  {/if}
 
   <!-- GPU Section -->
   <section class="space-y-4">

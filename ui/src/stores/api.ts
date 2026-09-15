@@ -492,9 +492,12 @@ export async function checkPerformanceEnabled(): Promise<void> {
   }
 }
 
-export async function fetchPerformance(after?: string): Promise<PerformanceResponse | null> {
+export async function fetchPerformance(after?: string, window?: "5m" | "15m" | "1h" | "24h" | "7d"): Promise<PerformanceResponse | null> {
   try {
-    const url = after ? `/api/performance?after=${encodeURIComponent(after)}` : "/api/performance";
+    const query = new URLSearchParams();
+    if (after) query.set("after", after);
+    if (window) query.set("window", window);
+    const url = query.size ? `/api/performance?${query}` : "/api/performance";
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);

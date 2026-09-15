@@ -29,7 +29,7 @@
 
   interface Dataset {
     label: string;
-    data: number[];
+    data: (number | null)[];
     borderColor: string;
   }
 
@@ -126,7 +126,7 @@
           borderColor: ds.borderColor,
           backgroundColor: ds.borderColor + "20",
           borderWidth: 1.5,
-          pointRadius: 0,
+          pointRadius: ds.data.filter((value) => value !== null).length === 1 ? 3 : 0,
           tension: 0.4,
           fill: false,
         })),
@@ -157,7 +157,7 @@
       borderColor: ds.borderColor,
       backgroundColor: ds.borderColor + "20",
       borderWidth: 1.5,
-      pointRadius: 0,
+      pointRadius: ds.data.filter((value) => value !== null).length === 1 ? 3 : 0,
       tension: 0.4,
       fill: false,
     }));
