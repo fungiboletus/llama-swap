@@ -502,6 +502,11 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}
 	reverseProxy.ErrorHandler = newProxyErrorHandler(p.id, p.proxyLogger)
 	reverseProxy.ModifyResponse = func(resp *http.Response) error {
+		// Upstreams such as llama-server set their own CORS headers, and
+		// ReverseProxy adds rather than replaces them, so both llama-swap's
+		// and the upstream's would be sent. Keep only ours; see issue #85.
+		swaputil.StripUpstreamCORSHeaders(resp.Header)
+
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			resp.Header.Set("X-Accel-Buffering", "no")
 		}
@@ -660,9 +665,20 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 		if err == nil {
 			p.processLogger.Debugf("<%s> sendStopSignal() running stop command: %s", p.id, strings.Join(stopArgs, " "))
 			stopCmd := exec.Command(stopArgs[0], stopArgs[1:]...)
+			stopCmd.Stderr = p.processLogger
+			stopCmd.Stdout = p.processLogger
+			// Bound the pipe copy so a CmdStop that backgrounds a child
+			// holding stdout/stderr cannot block Run() indefinitely.
+			stopCmd.WaitDelay = p.waitDelay
 			stopCmd.Env = cmd.Env
 			setProcAttributes(stopCmd)
 			runErr := stopCmd.Run()
+			// ErrWaitDelay is only returned when the stop command itself
+			// succeeded, so it is not a failure to stop the process.
+			if errors.Is(runErr, exec.ErrWaitDelay) {
+				p.processLogger.Warnf("<%s> sendStopSignal() stop command exited but a child held its output open; output may be truncated", p.id)
+				runErr = nil
+			}
 			if runErr != nil {
 				p.processLogger.Errorf("<%s> sendStopSignal() stop command failed: %v", p.id, runErr)
 			} else {

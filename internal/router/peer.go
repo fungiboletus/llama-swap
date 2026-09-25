@@ -91,9 +91,12 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			}
 		}
 
+		// Tailcat needs a new dial per request so a restarted server cannot
+		// strand an HTTP request on a connection from the old server.
 		peerTransport := &http.Transport{
 			Proxy:                 proxyFromEnvironment,
 			DialContext:           dialContext,
+			DisableKeepAlives:     tailcatClient != nil,
 			TLSHandshakeTimeout:   time.Duration(peer.Timeouts.TLSHandshake) * time.Second,
 			ResponseHeaderTimeout: time.Duration(peer.Timeouts.ResponseHeader) * time.Second,
 			ExpectContinueTimeout: time.Duration(peer.Timeouts.ExpectContinue) * time.Second,
@@ -112,6 +115,11 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 		}
 
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
+			// The peer is another llama-swap that already applied its own CORS
+			// policy. ReverseProxy adds rather than replaces headers, so keep
+			// only this instance's; see issue #85.
+			swaputil.StripUpstreamCORSHeaders(resp.Header)
+
 			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
 			}

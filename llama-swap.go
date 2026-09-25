@@ -27,7 +27,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
-	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 	"github.com/mostlygeek/llama-swap/internal/tailcat"
 	"github.com/mostlygeek/llama-swap/internal/watcher"
@@ -88,6 +88,9 @@ func configureTailcatListener(cfg *config.Config, keyPath string) error {
 	}
 	if cfg.Tailcat == nil || len(cfg.Tailcat.Models) == 0 {
 		return fmt.Errorf("-listen-tailcat requires tailcat.models to define at least one exposed model")
+	}
+	if len(cfg.Tailcat.Allow) == 0 {
+		slog.Warn(`tailcat.allow is empty: every Tailcat client will get 403 Forbidden; add client node keys, or "*" to allow any client`)
 	}
 	return nil
 }
@@ -236,7 +239,7 @@ func main() {
 	referenceDocs := docagent.NewWithSchema(docs.Files, docsConfigSchema)
 
 	initialStorePath := configStorePath(cfg)
-	initialStore, err := store.New(initialStorePath)
+	initialStore, err := sqlite.New(initialStorePath)
 	if err != nil {
 		slog.Error("failed to create store", "error", err)
 		os.Exit(1)
@@ -261,18 +264,20 @@ func main() {
 		activeMu.RUnlock()
 		srv.ServeTailcatHTTP(w, r)
 	})
+	tailcatLogger := func(cfg config.Config) tailcat.Logger {
+		if cfg.Tailcat != nil && cfg.Tailcat.Debug {
+			return proxyLog
+		}
+		return nil
+	}
 	startTailcat := func(cfg config.Config) (*tailcat.Server, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		opts := tailcat.ServerOptions{
-			PrivateKey:     tailcatPrivateKey,
-			AllowedClients: cfg.Tailcat.AllowedClients,
-			Handler:        tailcatHandler,
-		}
-		if cfg.Tailcat.Debug {
-			opts.Logger = proxyLog
-		}
-		return tailcat.Start(ctx, opts)
+		return tailcat.Start(ctx, tailcat.ServerOptions{
+			PrivateKey: tailcatPrivateKey,
+			Handler:    tailcatHandler,
+			Logger:     tailcatLogger(cfg),
+		})
 	}
 
 	var activeTailcat *tailcat.Server
@@ -341,7 +346,7 @@ func main() {
 		newStore := currentStore
 		storeChanged := newStorePath != currentStorePath
 		if storeChanged {
-			newStore, err = store.New(newStorePath)
+			newStore, err = sqlite.New(newStorePath)
 			if err != nil {
 				proxyLog.Warnf("failed to create new store during reload: %v", err)
 				return
@@ -359,6 +364,10 @@ func main() {
 
 		if currentTailcat != nil {
 			newSrv.SetTailcatAddress(currentTailcat.Address())
+			// The listener is never restarted: connected Tailcat clients do not
+			// reconnect to a restarted server. tailcat.allow is enforced by
+			// newSrv per request; only the debug logger needs updating here.
+			currentTailcat.SetLogger(tailcatLogger(newCfg))
 		}
 
 		activeMu.Lock()

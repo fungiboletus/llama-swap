@@ -28,7 +28,7 @@ type Auto struct {
 
 const memoryObservationVersion = "process-tree-rss-v1"
 
-func NewAuto(conf config.Config, proxylog, upstreamlog *logmon.Monitor, st *store.Store) (*Auto, error) {
+func NewAuto(conf config.Config, proxylog, upstreamlog *logmon.Monitor, st store.Store) (*Auto, error) {
 	if st == nil {
 		return nil, fmt.Errorf("auto router requires a store")
 	}
@@ -96,7 +96,7 @@ func (r *Auto) observeProcessMemoryHighWater() {
 type autoSwapper struct {
 	conf     config.Config
 	logger   *logmon.Monitor
-	store    *store.Store
+	store    store.Store
 	capacity uint64
 
 	mu           sync.Mutex
@@ -106,7 +106,7 @@ type autoSwapper struct {
 	lastUse      map[string]time.Time
 }
 
-func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st *store.Store) (*autoSwapper, error) {
+func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st store.Store) (*autoSwapper, error) {
 	settings := conf.Routing.Router.Settings.Auto
 	if settings == nil || settings.Capacity <= settings.Reserve {
 		return nil, fmt.Errorf("auto router requires a positive usable capacity")
@@ -125,7 +125,7 @@ func newAutoSwapper(conf config.Config, logger *logmon.Monitor, st *store.Store)
 			continue
 		}
 		fingerprint := memoryProfileFingerprint(id, model)
-		profile, found, err := st.LoadMemoryProfile(context.Background(), id, fingerprint)
+		profile, found, err := st.MemoryProfiles().Load(context.Background(), id, fingerprint)
 		if err != nil {
 			return nil, err
 		}
@@ -307,7 +307,7 @@ func (p *autoSwapper) OnMemoryObserved(modelID string, observed uint64, sampleEr
 		ObservedBytes: observed,
 		ObservedAt:    time.Now(),
 	}
-	if err := p.store.SaveMemoryProfile(context.Background(), profile); err != nil {
+	if err := p.store.MemoryProfiles().Save(context.Background(), profile); err != nil {
 		if p.logger != nil {
 			p.logger.Warnf("auto: saving process-tree memory profile for %s: %v", modelID, err)
 		}

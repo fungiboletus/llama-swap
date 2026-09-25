@@ -1,27 +1,29 @@
-package store
+package sqlite
 
 import (
 	"context"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
 func TestStore_InsertListAndFilterActivity(t *testing.T) {
 	ctx := context.Background()
-	store, err := New("")
+	st, err := New("")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
 	for i, model := range []string{"m1", "m2", "m1"} {
-		_, err := store.InsertActivity(ctx, ActivityLogEntry{
+		_, err := st.Activity().Insert(ctx, store.ActivityLogEntry{
 			Timestamp:         time.Unix(int64(100+i), 0),
 			Model:             model,
 			ReqPath:           "/v1/chat/completions",
 			AuthenticatedUser: "user-" + model,
-			Tokens: TokenMetrics{
+			Tokens: store.TokenMetrics{
 				InputTokens:     i + 1,
 				OutputTokens:    i + 2,
 				PromptPerSecond: float64(10 + i),
@@ -34,7 +36,7 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 		}
 	}
 
-	page, err := store.ListActivity(ctx, ActivityQuery{Limit: 2, Page: 1})
+	page, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 2, Page: 1})
 	if err != nil {
 		t.Fatalf("ListActivity: %v", err)
 	}
@@ -51,8 +53,8 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 		t.Fatalf("authenticated user = %q, want user-m1", page.Data[0].AuthenticatedUser)
 	}
 
-	filtered, err := store.ListActivity(ctx, ActivityQuery{
-		ActivityFilter: ActivityFilter{Models: []string{"m1"}},
+	filtered, err := st.Activity().List(ctx, store.ActivityQuery{
+		ActivityFilter: store.ActivityFilter{Models: []string{"m1"}},
 		Limit:          10,
 		Page:           1,
 	})
@@ -74,25 +76,25 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 func seedFilterActivity(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := New("")
+	st, err := New("")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { st.Close() })
 
 	for i, model := range []string{"m1", "m2", "m1", "m2", "m1"} {
-		if _, err := store.InsertActivity(ctx, ActivityLogEntry{
+		if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{
 			Timestamp: time.Unix(int64(1000+i), 0),
 			Model:     model,
 		}); err != nil {
 			t.Fatalf("InsertActivity: %v", err)
 		}
 	}
-	return store, ctx
+	return st, ctx
 }
 
 // entryIDs returns the ids of a page in the order they were returned.
-func entryIDs(entries []ActivityLogEntry) []int {
+func entryIDs(entries []store.ActivityLogEntry) []int {
 	ids := make([]int, len(entries))
 	for i, entry := range entries {
 		ids[i] = entry.ID
@@ -113,22 +115,22 @@ func equalIDs(got, want []int) bool {
 }
 
 func TestStore_ListActivityFilterTimeRange(t *testing.T) {
-	store, ctx := seedFilterActivity(t)
+	st, ctx := seedFilterActivity(t)
 
 	tests := []struct {
 		name   string
-		filter ActivityFilter
+		filter store.ActivityFilter
 		want   []int
 	}{
-		{"start only", ActivityFilter{Start: time.Unix(1002, 0)}, []int{5, 4, 3}},
-		{"end only", ActivityFilter{End: time.Unix(1001, 0)}, []int{2, 1}},
-		{"both bounds inclusive", ActivityFilter{Start: time.Unix(1001, 0), End: time.Unix(1003, 0)}, []int{4, 3, 2}},
-		{"empty range", ActivityFilter{Start: time.Unix(9000, 0)}, []int{}},
+		{"start only", store.ActivityFilter{Start: time.Unix(1002, 0)}, []int{5, 4, 3}},
+		{"end only", store.ActivityFilter{End: time.Unix(1001, 0)}, []int{2, 1}},
+		{"both bounds inclusive", store.ActivityFilter{Start: time.Unix(1001, 0), End: time.Unix(1003, 0)}, []int{4, 3, 2}},
+		{"empty range", store.ActivityFilter{Start: time.Unix(9000, 0)}, []int{}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page, err := store.ListActivity(ctx, ActivityQuery{ActivityFilter: tt.filter, Limit: 10, Page: 1})
+			page, err := st.Activity().List(ctx, store.ActivityQuery{ActivityFilter: tt.filter, Limit: 10, Page: 1})
 			if err != nil {
 				t.Fatalf("ListActivity: %v", err)
 			}
@@ -143,22 +145,22 @@ func TestStore_ListActivityFilterTimeRange(t *testing.T) {
 }
 
 func TestStore_ListActivityFilterIDRange(t *testing.T) {
-	store, ctx := seedFilterActivity(t)
+	st, ctx := seedFilterActivity(t)
 
 	tests := []struct {
 		name   string
-		filter ActivityFilter
+		filter store.ActivityFilter
 		want   []int
 	}{
-		{"min only", ActivityFilter{MinID: 4}, []int{5, 4}},
-		{"max only", ActivityFilter{MaxID: 2}, []int{2, 1}},
-		{"both bounds inclusive", ActivityFilter{MinID: 2, MaxID: 4}, []int{4, 3, 2}},
-		{"single row", ActivityFilter{MinID: 3, MaxID: 3}, []int{3}},
+		{"min only", store.ActivityFilter{MinID: 4}, []int{5, 4}},
+		{"max only", store.ActivityFilter{MaxID: 2}, []int{2, 1}},
+		{"both bounds inclusive", store.ActivityFilter{MinID: 2, MaxID: 4}, []int{4, 3, 2}},
+		{"single row", store.ActivityFilter{MinID: 3, MaxID: 3}, []int{3}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page, err := store.ListActivity(ctx, ActivityQuery{ActivityFilter: tt.filter, Limit: 10, Page: 1})
+			page, err := st.Activity().List(ctx, store.ActivityQuery{ActivityFilter: tt.filter, Limit: 10, Page: 1})
 			if err != nil {
 				t.Fatalf("ListActivity: %v", err)
 			}
@@ -173,7 +175,7 @@ func TestStore_ListActivityFilterIDRange(t *testing.T) {
 }
 
 func TestStore_ListActivityFilterModels(t *testing.T) {
-	store, ctx := seedFilterActivity(t)
+	st, ctx := seedFilterActivity(t)
 
 	tests := []struct {
 		name   string
@@ -189,8 +191,8 @@ func TestStore_ListActivityFilterModels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page, err := store.ListActivity(ctx, ActivityQuery{
-				ActivityFilter: ActivityFilter{Models: tt.models},
+			page, err := st.Activity().List(ctx, store.ActivityQuery{
+				ActivityFilter: store.ActivityFilter{Models: tt.models},
 				Limit:          10,
 				Page:           1,
 			})
@@ -207,10 +209,10 @@ func TestStore_ListActivityFilterModels(t *testing.T) {
 // Combined filters must AND together, and Total/TotalPages must describe the
 // filtered set rather than the whole table.
 func TestStore_ListActivityFilterCombinedPaging(t *testing.T) {
-	store, ctx := seedFilterActivity(t)
+	st, ctx := seedFilterActivity(t)
 
-	page, err := store.ListActivity(ctx, ActivityQuery{
-		ActivityFilter: ActivityFilter{
+	page, err := st.Activity().List(ctx, store.ActivityQuery{
+		ActivityFilter: store.ActivityFilter{
 			Models: []string{"m1"},
 			Start:  time.Unix(1001, 0),
 			MinID:  2,
@@ -234,25 +236,25 @@ func TestStore_ListActivityFilterCombinedPaging(t *testing.T) {
 
 func TestStore_ListActivitySort(t *testing.T) {
 	ctx := context.Background()
-	store, err := New("")
+	st, err := New("")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
 	// Insert rows whose output_tokens ordering differs from insertion (id) order.
 	outputs := []int{30, 10, 20}
 	for i, out := range outputs {
-		if _, err := store.InsertActivity(ctx, ActivityLogEntry{
+		if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{
 			Timestamp: time.Unix(int64(100+i), 0),
 			Model:     "m1",
-			Tokens:    TokenMetrics{OutputTokens: out},
+			Tokens:    store.TokenMetrics{OutputTokens: out},
 		}); err != nil {
 			t.Fatalf("InsertActivity: %v", err)
 		}
 	}
 
-	asc, err := store.ListActivity(ctx, ActivityQuery{Limit: 10, Page: 1, Sort: "generated", Order: "asc"})
+	asc, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 10, Page: 1, Sort: "generated", Order: "asc"})
 	if err != nil {
 		t.Fatalf("ListActivity asc: %v", err)
 	}
@@ -264,7 +266,7 @@ func TestStore_ListActivitySort(t *testing.T) {
 		t.Fatalf("ascending generated sort = %v", gotAsc)
 	}
 
-	desc, err := store.ListActivity(ctx, ActivityQuery{Limit: 10, Page: 1, Sort: "generated", Order: "desc"})
+	desc, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 10, Page: 1, Sort: "generated", Order: "desc"})
 	if err != nil {
 		t.Fatalf("ListActivity desc: %v", err)
 	}
@@ -277,7 +279,7 @@ func TestStore_ListActivitySort(t *testing.T) {
 	}
 
 	// Unknown sort keys fall back to id ordering (newest first).
-	fallback, err := store.ListActivity(ctx, ActivityQuery{Limit: 10, Page: 1, Sort: "bogus"})
+	fallback, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 10, Page: 1, Sort: "bogus"})
 	if err != nil {
 		t.Fatalf("ListActivity fallback: %v", err)
 	}
@@ -288,17 +290,17 @@ func TestStore_ListActivitySort(t *testing.T) {
 
 func TestStore_ActivityStats(t *testing.T) {
 	ctx := context.Background()
-	store, err := New("")
+	st, err := New("")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
-	entries := []ActivityLogEntry{
+	entries := []store.ActivityLogEntry{
 		{
 			Timestamp: time.Unix(1, 0),
 			Model:     "m1",
-			Tokens: TokenMetrics{
+			Tokens: store.TokenMetrics{
 				CachedTokens:    2,
 				InputTokens:     10,
 				OutputTokens:    20,
@@ -309,7 +311,7 @@ func TestStore_ActivityStats(t *testing.T) {
 		{
 			Timestamp: time.Unix(2, 0),
 			Model:     "m1",
-			Tokens: TokenMetrics{
+			Tokens: store.TokenMetrics{
 				CachedTokens:    -1,
 				InputTokens:     5,
 				OutputTokens:    8,
@@ -320,7 +322,7 @@ func TestStore_ActivityStats(t *testing.T) {
 		{
 			Timestamp: time.Unix(3, 0),
 			Model:     "m2",
-			Tokens: TokenMetrics{
+			Tokens: store.TokenMetrics{
 				InputTokens:     7,
 				OutputTokens:    9,
 				PromptPerSecond: 300,
@@ -328,12 +330,12 @@ func TestStore_ActivityStats(t *testing.T) {
 		},
 	}
 	for _, entry := range entries {
-		if _, err := store.InsertActivity(ctx, entry); err != nil {
+		if _, err := st.Activity().Insert(ctx, entry); err != nil {
 			t.Fatalf("InsertActivity: %v", err)
 		}
 	}
 
-	stats, err := store.ActivityStats(ctx, ActivityStatsQuery{Model: "m1"})
+	stats, err := st.Activity().Stats(ctx, store.ActivityStatsQuery{Model: "m1"})
 	if err != nil {
 		t.Fatalf("ActivityStats: %v", err)
 	}
@@ -347,21 +349,21 @@ func TestStore_ActivityStats(t *testing.T) {
 
 func TestStore_PruneActivity(t *testing.T) {
 	ctx := context.Background()
-	store, err := New("")
+	st, err := New("")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
 	for i := 0; i < 5; i++ {
-		if _, err := store.InsertActivity(ctx, ActivityLogEntry{Timestamp: time.Unix(int64(i), 0), Model: "m"}); err != nil {
+		if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{Timestamp: time.Unix(int64(i), 0), Model: "m"}); err != nil {
 			t.Fatalf("InsertActivity: %v", err)
 		}
 	}
-	if err := store.PruneActivity(ctx, 2); err != nil {
+	if err := st.Activity().Prune(ctx, 2); err != nil {
 		t.Fatalf("PruneActivity: %v", err)
 	}
-	page, err := store.ListActivity(ctx, ActivityQuery{Limit: 10, Page: 1})
+	page, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 10, Page: 1})
 	if err != nil {
 		t.Fatalf("ListActivity: %v", err)
 	}
@@ -371,47 +373,69 @@ func TestStore_PruneActivity(t *testing.T) {
 	if page.Data[0].ID != 5 || page.Data[1].ID != 4 {
 		t.Fatalf("kept IDs = %+v", page.Data)
 	}
+	stats, err := st.Activity().Stats(ctx, store.ActivityStatsQuery{})
+	if err != nil {
+		t.Fatalf("ActivityStats: %v", err)
+	}
+	if stats.TotalRequests != 5 {
+		t.Fatalf("total requests after prune = %d, want 5", stats.TotalRequests)
+	}
+
+	modelStats, err := st.Activity().Stats(ctx, store.ActivityStatsQuery{Model: "m"})
+	if err != nil {
+		t.Fatalf("model ActivityStats: %v", err)
+	}
+	if modelStats.TotalRequests != 5 {
+		t.Fatalf("model total requests after prune = %d, want 5", modelStats.TotalRequests)
+	}
 }
 
 func TestStore_NewFilePersistsActivity(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "llama-swap.sqlite")
 
-	store, err := New(path)
+	st, err := New(path)
 	if err != nil {
 		t.Fatalf("New file store: %v", err)
 	}
-	if _, err := store.InsertActivity(ctx, ActivityLogEntry{Timestamp: time.Unix(1, 0), Model: "m"}); err != nil {
+	if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{Timestamp: time.Unix(1, 0), Model: "m"}); err != nil {
 		t.Fatalf("InsertActivity: %v", err)
 	}
-	if err := store.Close(); err != nil {
+	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	store, err = New(path)
+	st, err = New(path)
 	if err != nil {
 		t.Fatalf("reopen file store: %v", err)
 	}
-	defer store.Close()
-	page, err := store.ListActivity(ctx, ActivityQuery{Limit: 10, Page: 1})
+	defer st.Close()
+	page, err := st.Activity().List(ctx, store.ActivityQuery{Limit: 10, Page: 1})
 	if err != nil {
 		t.Fatalf("ListActivity: %v", err)
 	}
 	if page.Total != 1 || len(page.Data) != 1 || page.Data[0].Model != "m" {
 		t.Fatalf("page = %+v", page)
 	}
+	stats, err := st.Activity().Stats(ctx, store.ActivityStatsQuery{Model: "m"})
+	if err != nil {
+		t.Fatalf("ActivityStats: %v", err)
+	}
+	if stats.TotalRequests != 1 {
+		t.Fatalf("total requests = %d, want 1", stats.TotalRequests)
+	}
 }
 
 func TestStore_NewFileUsesWAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llama-swap.sqlite")
-	store, err := New(path)
+	st, err := New(path)
 	if err != nil {
 		t.Fatalf("New file store: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
 	var mode string
-	if err := store.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+	if err := st.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		t.Fatalf("journal_mode: %v", err)
 	}
 	if mode != "wal" {
@@ -425,13 +449,13 @@ func TestStore_MemoryProfilePersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	profile := MemoryProfile{
+	profile := store.MemoryProfile{
 		ModelID:       "model",
 		Fingerprint:   "deployment-fingerprint",
 		ObservedBytes: 1234,
 		ObservedAt:    time.Unix(42, 0),
 	}
-	if err := st.SaveMemoryProfile(context.Background(), profile); err != nil {
+	if err := st.MemoryProfiles().Save(context.Background(), profile); err != nil {
 		t.Fatalf("SaveMemoryProfile: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -443,11 +467,83 @@ func TestStore_MemoryProfilePersists(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer st.Close()
-	got, found, err := st.LoadMemoryProfile(context.Background(), profile.ModelID, profile.Fingerprint)
+	got, found, err := st.MemoryProfiles().Load(context.Background(), profile.ModelID, profile.Fingerprint)
 	if err != nil {
 		t.Fatalf("LoadMemoryProfile: %v", err)
 	}
 	if !found || got.ObservedBytes != profile.ObservedBytes || !got.ObservedAt.Equal(profile.ObservedAt) {
 		t.Errorf("loaded profile = %+v, found=%v", got, found)
+	}
+}
+
+func TestStore_ForkSchemaUpgradePreservesActivity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fork.db")
+	st, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{Model: "m", AuthenticatedUser: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MemoryProfiles().Save(ctx, store.MemoryProfile{ModelID: "m", Fingerprint: "f", ObservedBytes: 42}); err != nil {
+		t.Fatal(err)
+	}
+	// The deployed fork was at Goose version 4 without upstream's cache table.
+	if _, err := st.db.Exec(`DROP TABLE cache`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM goose_db_version WHERE version_id = 5`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st, err = New(path)
+	if err != nil {
+		t.Fatalf("upgrade fork database: %v", err)
+	}
+	defer st.Close()
+	page, err := st.Activity().List(ctx, store.ActivityQuery{})
+	if err != nil || len(page.Data) != 1 || page.Data[0].AuthenticatedUser != "alice" {
+		t.Fatalf("preserved activity: page=%+v err=%v", page, err)
+	}
+	profile, found, err := st.MemoryProfiles().Load(ctx, "m", "f")
+	if err != nil || !found || profile.ObservedBytes != 42 {
+		t.Fatalf("preserved memory profile: profile=%+v found=%v err=%v", profile, found, err)
+	}
+	if _, err := st.db.Exec(`SELECT key FROM cache LIMIT 1`); err != nil {
+		t.Fatalf("cache migration: %v", err)
+	}
+}
+
+func TestStore_UpstreamSchemaUpgradeAddsForkData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upstream.db")
+	st, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Upstream's version 3 has source and cache, but no fork fields.
+	for _, statement := range []string{
+		`DELETE FROM goose_db_version WHERE version_id IN (4, 5)`,
+		`DROP TABLE memory_profiles`,
+		`ALTER TABLE activity DROP COLUMN authenticated_user`,
+	} {
+		if _, err := st.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	st, err = New(path)
+	if err != nil {
+		t.Fatalf("upgrade upstream database: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{Model: "m", AuthenticatedUser: "alice"}); err != nil {
+		t.Fatalf("authenticated activity: %v", err)
+	}
+	if err := st.MemoryProfiles().Save(ctx, store.MemoryProfile{ModelID: "m", Fingerprint: "f", ObservedBytes: 42}); err != nil {
+		t.Fatalf("memory profile: %v", err)
 	}
 }

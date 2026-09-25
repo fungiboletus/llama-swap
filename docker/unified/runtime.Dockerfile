@@ -34,7 +34,7 @@ FROM ${IK_LLAMA_IMAGE} AS ik-llama-src
 
 FROM ${BUILDER_BASE} AS llama-swap-download
 ARG LS_VERSION=latest
-COPY install-llama-swap.sh /build/
+COPY lib-release.sh install-llama-swap.sh /build/
 RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 # ── vllm-wrapper ──────────────────────────────────────────────────────
@@ -44,10 +44,29 @@ RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 FROM golang:1.27-bookworm AS vllm-wrapper-build
 ARG LS_VERSION=latest
-COPY install-vllm-wrapper.sh /build/
+COPY lib-release.sh install-vllm-wrapper.sh /build/
 RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
     --mount=type=cache,id=go-mod,target=/go/pkg/mod \
     bash /build/install-vllm-wrapper.sh "${LS_VERSION}"
+
+# ── kubeswap ──────────────────────────────────────────────────────────
+#
+# kubeswap is the Kubernetes backend wrapper (cmd/cmdStop) for managing
+# inference servers in a namespace; see cmd/kubeswap/README.md. Like
+# vllm-wrapper it is compiled from the same revision as llama-swap.
+
+FROM golang:1.27-bookworm AS kubeswap-build
+# Same LS_VERSION as the other Go stages, so one build arg (or the CI's
+# single resolved revision) controls llama-swap, vllm-wrapper and
+# kubeswap together. If that revision predates cmd/kubeswap (no release
+# ships it yet), the installer aborts with a clear error; until the
+# first such release is out, build an explicit revision with
+# --build-arg LS_VERSION=<commit-or-tag>.
+ARG LS_VERSION=latest
+COPY lib-release.sh install-kubeswap.sh /build/
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    bash /build/install-kubeswap.sh "${LS_VERSION}"
 
 # ── Runtime bases ─────────────────────────────────────────────────────
 
@@ -65,7 +84,7 @@ ENV PATH="/usr/local/bin:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 python3 curl ca-certificates \
     libavcodec60 libavformat60 libavutil58 libswresample4 \
-    ffmpeg \
+    ffmpeg libmp3lame0 \
     && rm -rf /var/lib/apt/lists/*
 
 # CUDA stub drivers for container compatibility
@@ -84,7 +103,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rocm-smi \
     python3 curl ca-certificates \
     libavcodec60 libavformat60 libavutil58 libswresample4 \
-    ffmpeg \
+    ffmpeg libmp3lame0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Select runtime base by BACKEND ────────────────────────────────────
@@ -153,6 +172,9 @@ COPY --from=llama-swap-download /install/llama-swap-version /tmp/
 
 # Copy vllm-wrapper binary
 COPY --from=vllm-wrapper-build /install/bin/vllm-wrapper /usr/local/bin/
+
+# Copy kubeswap binary
+COPY --from=kubeswap-build /install/bin/kubeswap /usr/local/bin/
 
 RUN ldconfig
 

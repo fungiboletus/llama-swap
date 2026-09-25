@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/capcompat"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/docagent"
@@ -21,6 +23,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/internal/tailcat"
 )
 
 // Server owns the HTTP mux, cross-cutting middleware, and the local/peer model
@@ -33,14 +36,36 @@ type Server struct {
 	proxylog    *logmon.Monitor
 	upstreamlog *logmon.Monitor
 
-	perf      *perf.Monitor
-	inflight  *inflightTracker
-	metrics   *metricsMonitor
-	store     *store.Store
-	build     BuildInfo
-	hardware  *hw.HardwareSnapshot
+	perf     *perf.Monitor
+	inflight *inflightTracker
+	metrics  *metricsMonitor
+	store    store.Store
+	build    BuildInfo
+	hardware *hw.HardwareSnapshot
+
+	// reference is llama-swap's own embedded documentation, served to the
+	// Playground's agentic chat and to external MCP clients through /api/mcp.
+	// It is immutable and independent of cfg, so the same library is shared
+	// across the Server instances a hot config reload creates. A nil value
+	// disables the endpoint; Docs methods are nil-receiver safe.
 	reference *docagent.Docs
-	tools     *mcptools.Registry
+
+	// capcompat holds model capabilities discovered from upstream servers.
+	// It is refreshed when a model becomes ready and read by /v1/models, so
+	// an unloaded model still advertises what it can do. A nil value disables
+	// discovery; Service methods are nil-receiver safe.
+	capcompat *capcompat.Service
+
+	// capcompatCancel unsubscribes the process-state listener that drives
+	// discovery. The event dispatcher is process-wide, so a hot config reload
+	// would otherwise leave the retired Server probing alongside the new one.
+	capcompatCancel context.CancelFunc
+
+	// tools is the MCP tool surface served at /api/mcp. Providers are
+	// aggregated here rather than enumerated in the handler, so a future
+	// provider that proxies an upstream MCP endpoint plugs in without
+	// touching the transport.
+	tools *mcptools.Registry
 
 	profileMu     sync.RWMutex
 	activeProfile string
@@ -230,11 +255,10 @@ type BuildInfo struct {
 	Date    string
 }
 
-func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
+func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
 	if err := prepareOllamaModels(context.Background(), &cfg); err != nil {
 		return nil, fmt.Errorf("preparing Ollama models: %w", err)
 	}
-
 	var local router.LocalRouter
 	var err error
 
@@ -266,22 +290,28 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	}
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:         cfg,
-		muxlog:      muxlog,
-		proxylog:    proxylog,
-		upstreamlog: upstreamlog,
-		perf:        perfMon,
-		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
-		store:       st,
-		build:       build,
-		hardware:    hardware,
-		reference:   refs,
-		local:       local,
-		peer:        peer,
-		shutdownCtx: shutdownCtx,
-		shutdownFn:  shutdownFn,
+		cfg:           cfg,
+		muxlog:        muxlog,
+		proxylog:      proxylog,
+		upstreamlog:   upstreamlog,
+		perf:          perfMon,
+		inflight:      newInflightTracker(),
+		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		store:         st,
+		build:         build,
+		hardware:      hardware,
+		reference:     refs,
+		activeProfile: cfg.Hooks.OnStartup.Profile,
+		local:         local,
+		peer:          peer,
+		shutdownCtx:   shutdownCtx,
+		shutdownFn:    shutdownFn,
 	}
+	s.capcompat = capcompat.New(st.Cache(), proxylog)
+	s.capcompatCancel = event.On(s.onProcessStateChange)
+
+	// SysProvider is constructed here because this is where perf and hardware
+	// are in scope; wiring those in later is a change to internal/mcptools.
 	tools, err := mcptools.New(
 		docagent.NewDocsProvider(refs),
 		mcptools.NewSysProvider(nil),
@@ -434,9 +464,8 @@ func (s *Server) routes() {
 	register("GET /upstream", http.HandlerFunc(handleUpstreamRedirect))
 	register("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
 
-	// ComfyUI compatibility passthrough. This uses the fixed comfyui_auto model,
-	// whose compatibility settings are applied while loading config. Only the
-	// root path may start an unloaded model.
+	// ComfyUI compatibility passthrough uses the fixed comfyui_auto model.
+	// A GET to /ws may not start an unloaded model.
 	register("/comfyui", http.HandlerFunc(handleComfyUIRedirect))
 	register("/comfyui/{comfyPath...}", http.HandlerFunc(s.handleComfyUI))
 
@@ -457,7 +486,7 @@ func (s *Server) routes() {
 	register("GET /api/tailcat", http.HandlerFunc(s.handleAPITailcat))
 
 	s.mux = mux
-	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
+	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware(s.cfg)).Then(mux)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -470,6 +499,13 @@ func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
 	tc := s.cfg.Tailcat
 	if !s.cfg.TailcatEnabled() || tc == nil {
 		http.NotFound(w, r)
+		return
+	}
+	// tailcat.allow is enforced per request rather than by the Tailcat
+	// listener so config reloads can change it without restarting the
+	// listener, and so removed keys lose access on kept-alive connections.
+	if !tailcatClientAllowed(tc.Allow, r) {
+		http.Error(w, "Tailcat client not allowed", http.StatusForbidden)
 		return
 	}
 
@@ -497,6 +533,17 @@ func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(context.WithValue(r.Context(), tailcatRequestContextKey{}, true))
 	s.handler.ServeHTTP(w, r)
+}
+
+// tailcatClientAllowed reports whether the request's authenticated Tailcat
+// node key is in allow. Access is denied by default: an empty allow list
+// permits no client, and "*" permits every client.
+func tailcatClientAllowed(allow []string, r *http.Request) bool {
+	if slices.Contains(allow, config.TailcatAllowAll) {
+		return true
+	}
+	nodeKey, ok := tailcat.NodeKeyFromContext(r.Context())
+	return ok && slices.Contains(allow, nodeKey)
 }
 
 func isTailcatInferenceRequest(r *http.Request) bool {
@@ -569,6 +616,9 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	if s.capcompatCancel != nil {
+		s.capcompatCancel()
+	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex

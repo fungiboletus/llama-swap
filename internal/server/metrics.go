@@ -38,14 +38,14 @@ func (e ActivityLogEvent) Type() uint32 {
 // activity in a store, and (when captures are enabled) stores
 // zstd+CBOR-compressed request/response captures in a sized in-memory cache.
 type metricsMonitor struct {
-	store          *store.Store
+	store          store.Store
 	maxMetrics     int
 	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
 }
 
-func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st *store.Store) *metricsMonitor {
+func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
 	if maxMetrics <= 0 {
 		maxMetrics = 1000
 	}
@@ -69,13 +69,13 @@ func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) (ActivityLogEntr
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stored, err := mp.store.InsertActivity(ctx, metric)
+	stored, err := mp.store.Activity().Insert(ctx, metric)
 	if err != nil {
 		mp.warnf("failed to persist activity metric: %v", err)
 		return ActivityLogEntry{}, false
 	}
 	if mp.store.IsInMemory() {
-		if err := mp.store.PruneActivity(ctx, mp.maxMetrics); err != nil {
+		if err := mp.store.Activity().Prune(ctx, mp.maxMetrics); err != nil {
 			mp.warnf("failed to prune activity metrics: %v", err)
 		}
 	}
@@ -115,11 +115,17 @@ func (mp *metricsMonitor) Close() error {
 	return nil
 }
 
-// activitySource returns trusted connection metadata for activity records.
-// Forwarding headers are intentionally ignored because callers can spoof them.
+// activitySource returns connection metadata for activity records. It
+// prefers Tailcat's authenticated source, then falls back to the
+// X-Forwarded-For/X-Real-IP headers (prefixed with "xff:" since a proxy
+// header is client-supplied and can be spoofed), and finally the raw
+// connection address.
 func activitySource(r *http.Request) string {
 	if source, ok := tailcat.SourceFromContext(r.Context()); ok {
 		return source
+	}
+	if ip, ok := forwardedIP(r); ok {
+		return "xff:" + ip
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

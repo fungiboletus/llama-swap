@@ -117,7 +117,12 @@ func (s *Server) modelStatus() []apiModel {
 		if st, ok := running[id]; ok {
 			state = string(st)
 		}
-		_, capsMap, _, ctxLen := renderCapabilities(mc.Capabilities)
+		// Same resolution /v1/models uses, so the dashboard and the OpenAI
+		// listing never disagree about what a model can do. Bound by
+		// shutdownCtx rather than a request: modelStatus is also called from
+		// event callbacks that have no request of their own.
+		caps := s.resolveCapabilities(s.shutdownCtx, id, mc)
+		_, capsMap, _, ctxLen := renderCapabilities(caps)
 		models = append(models, apiModel{
 			Id:            id,
 			Name:          mc.Name,
@@ -170,7 +175,7 @@ func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	page, err := s.store.ListActivity(r.Context(), query)
+	page, err := s.store.Activity().List(r.Context(), query)
 	if err != nil {
 		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to get activity")
 		return
@@ -182,7 +187,7 @@ func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
 
 // handleAPIActivityStats serves aggregate activity statistics and histograms.
 func (s *Server) handleAPIActivityStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.ActivityStats(r.Context(), store.ActivityStatsQuery{
+	stats, err := s.store.Activity().Stats(r.Context(), store.ActivityStatsQuery{
 		Model: strings.TrimSpace(r.URL.Query().Get("model")),
 	})
 	if err != nil {
@@ -293,7 +298,7 @@ func parseActivityQuery(r *http.Request) (store.ActivityQuery, error) {
 	}
 
 	if raw := strings.TrimSpace(r.URL.Query().Get("sort")); raw != "" {
-		if _, ok := store.ActivitySortColumn(raw); !ok {
+		if !store.ValidActivitySortKey(raw) {
 			return store.ActivityQuery{}, fmt.Errorf("invalid sort column")
 		}
 		query.Sort = raw
@@ -777,6 +782,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() })()
+	defer event.On(func(e swaputil.ModelCapabilitiesChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ProfileChangedEvent) {
 		sendProfile()

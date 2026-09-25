@@ -1,5 +1,5 @@
 -- +goose Up
-CREATE TABLE memory_profiles (
+CREATE TABLE IF NOT EXISTS memory_profiles (
     model_id TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     observed_bytes INTEGER NOT NULL,

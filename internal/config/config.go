@@ -256,6 +256,9 @@ type Config struct {
 
 	// Ollama enables locally managed, isolated Ollama model lanes.
 	Ollama OllamaConfig `yaml:"ollama"`
+
+	// security groups CORS and related hardening settings, see issue #1133
+	Security SecurityConfig `yaml:"security"`
 	// tailcatEnabled records whether this process started a Tailcat listener.
 	// It is runtime state, not user configuration, so it must never appear in
 	// rendered configuration output.
