@@ -58,7 +58,7 @@ func (s *Server) serveOllamaLoad(w http.ResponseWriter, r *http.Request, target 
 	}
 
 	if err := s.loadLocalModel(r.Context(), target.localID); err != nil {
-		s.proxylog.Warnf("ollama load: %v", err)
+		s.logs.ProxyLogs.Warnf("ollama load: %v", err)
 		sendOllamaError(w, http.StatusBadGateway, "model could not be loaded")
 		return
 	}

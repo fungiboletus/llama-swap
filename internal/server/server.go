@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -32,9 +33,7 @@ import (
 type Server struct {
 	cfg config.Config
 
-	muxlog      *logmon.Monitor
-	proxylog    *logmon.Monitor
-	upstreamlog *logmon.Monitor
+	logs *logmon.Group
 
 	perf     *perf.Monitor
 	inflight *inflightTracker
@@ -125,7 +124,7 @@ func (s *Server) setActiveProfile(name string) (bool, error) {
 	s.activeProfile = name
 	s.profileMu.Unlock()
 
-	s.proxylog.Infof("active profile changed to %q", name)
+	s.logs.ProxyLogs.Infof("active profile changed to %q", name)
 	event.Emit(swaputil.ProfileChangedEvent{Active: name})
 	return true, nil
 }
@@ -149,6 +148,7 @@ var modelPostJSONRoutes = []string{
 	"/v1/images/generations",
 	"/sdapi/v1/txt2img",
 	"/sdapi/v1/img2img",
+	"/v1/systemone",
 
 	// audio.cpp generic task API
 	"/audioapi/v1/tasks/run",
@@ -211,13 +211,15 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 	case "GET /v1/models", "GET /models", "GET /health", "GET /wol-health", "GET /{$}", "HEAD /{$}",
 		"GET /api/version", "GET /api/tags", "GET /api/ps", "POST /api/show", "POST /api/chat", "POST /api/generate":
 		return routeInference, true
-	case "GET /favicon.ico":
+	case "GET /favicon.ico", "/ui", "GET /ui/site.webmanifest",
+		"GET /ui/web-app-manifest-192x192.png", "GET /ui/web-app-manifest-512x512.png":
 		return routePublic, true
 	case "GET /logs", "GET /logs/stream", "GET /logs/stream/{logMonitorID...}",
 		"GET /ui/", "GET /metrics", "GET /unload", "GET /running", "GET /upstream",
 		"/upstream/{upstreamPath...}", "/comfyui", "/comfyui/{comfyPath...}",
 		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
 		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
+		"GET /api/events/logs", "/audiocpp", "/audiocpp/{audioCppPath...}",
 		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
 		"GET /api/tailcat", "GET /api/hardware", "GET /api/residency", "GET /api/captures/{id}",
 		"/api/mcp":
@@ -255,7 +257,7 @@ type BuildInfo struct {
 	Date    string
 }
 
-func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
+func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
 	if err := prepareOllamaModels(context.Background(), &cfg); err != nil {
 		return nil, fmt.Errorf("preparing Ollama models: %w", err)
 	}
@@ -264,23 +266,23 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 
 	switch cfg.Routing.Router.Use {
 	case "matrix":
-		local, err = router.NewMatrix(cfg, proxylog, upstreamlog)
+		local, err = router.NewMatrix(cfg, logs)
 		if err != nil {
 			return nil, fmt.Errorf("creating matrix router: %w", err)
 		}
 	case "auto":
-		local, err = router.NewAuto(cfg, proxylog, upstreamlog, st)
+		local, err = router.NewAuto(cfg, logs.ProxyLogs, logs.UpstreamLogs, st)
 		if err != nil {
 			return nil, fmt.Errorf("creating auto router: %w", err)
 		}
 	default: // "group"
-		local, err = router.NewGroup(cfg, proxylog, upstreamlog)
+		local, err = router.NewGroup(cfg, logs)
 		if err != nil {
 			return nil, fmt.Errorf("creating group router: %w", err)
 		}
 	}
 
-	peer, err := router.NewPeer(cfg, proxylog)
+	peer, err := router.NewPeer(cfg, logs.ProxyLogs)
 	if err != nil {
 		return nil, fmt.Errorf("creating peer router: %w", err)
 	}
@@ -291,12 +293,10 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:           cfg,
-		muxlog:        muxlog,
-		proxylog:      proxylog,
-		upstreamlog:   upstreamlog,
+		logs:          logs,
 		perf:          perfMon,
 		inflight:      newInflightTracker(),
-		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		metrics:       newMetricsMonitor(logs.ProxyLogs, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
 		store:         st,
 		build:         build,
 		hardware:      hardware,
@@ -307,7 +307,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		shutdownCtx:   shutdownCtx,
 		shutdownFn:    shutdownFn,
 	}
-	s.capcompat = capcompat.New(st.Cache(), proxylog)
+	s.capcompat = capcompat.New(st.Cache(), logs.ProxyLogs)
 	s.capcompatCancel = event.On(s.onProcessStateChange)
 
 	// SysProvider is constructed here because this is where perf and hardware
@@ -322,8 +322,8 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	}
 	s.tools = tools
 	s.routes()
-	if len(cfg.RequiredAPIKeys) == 0 && len(cfg.AdminAPIKeys) == 0 && proxylog != nil {
-		proxylog.Warnf("no apiKeys or adminApiKeys configured; inference and administration are open")
+	if len(cfg.RequiredAPIKeys) == 0 && len(cfg.AdminAPIKeys) == 0 && logs.ProxyLogs != nil {
+		logs.ProxyLogs.Warnf("no apiKeys or adminApiKeys configured; inference and administration are open")
 	}
 	s.startPreload()
 	return s, nil
@@ -341,16 +341,39 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.serveConfiguredVoices(w, r, data.ModelID) {
+		return
+	}
+
 	switch {
 	case s.local.Handles(data.ModelID):
-		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
+		s.logs.ProxyLogs.Debugf("dispatch: using local process for model: %s", data.ModelID)
 		s.local.ServeHTTP(w, r)
 	case s.peer.Handles(data.ModelID):
-		s.proxylog.Debugf("dispatch: using peer for model: %s", data.ModelID)
+		s.logs.ProxyLogs.Debugf("dispatch: using peer for model: %s", data.ModelID)
 		s.peer.ServeHTTP(w, r)
 	default:
 		swaputil.SendError(w, r, router.ErrNoRouterFound)
 	}
+}
+
+// serveConfiguredVoices answers GET /v1/audio/voices from the model's
+// capabilities.voices when it is set, without starting the model or contacting
+// the upstream. It reports whether it wrote the response.
+func (s *Server) serveConfiguredVoices(w http.ResponseWriter, r *http.Request, modelID string) bool {
+	if r.Method != http.MethodGet || r.URL.Path != "/v1/audio/voices" {
+		return false
+	}
+	mc, ok := s.cfg.Models[modelID]
+	if !ok || len(mc.Capabilities.Voices) == 0 {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"voices": mc.Capabilities.Voices,
+		"model":  modelID,
+	})
+	return true
 }
 
 // stripVersionPrefix rewrites versionless /v/... requests to their /... form
@@ -373,7 +396,7 @@ func stripAudioAPIPrefix(r *http.Request) {
 func (s *Server) routes() {
 	inferenceAuthMW := CreateInferenceAuthMiddleware(s.cfg)
 	adminAuthMW := CreateAdminAuthMiddleware(s.cfg)
-	modelMWs := []chain.Middleware{inferenceAuthMW}
+	modelMWs := []chain.Middleware{inferenceAuthMW, createContentTypeMiddleware()}
 	// globalConcurrencyLimit guards the top of the inference chain; a limit of
 	// 0 (the default) means no limit, so the handler is left out of the chain
 	// entirely rather than wrapping every request in a no-op semaphore.
@@ -443,8 +466,26 @@ func (s *Server) routes() {
 	register("POST /api/chat", http.HandlerFunc(s.handleOllamaChat))
 	register("POST /api/generate", http.HandlerFunc(s.handleOllamaGenerate))
 
-	// Embedded UI.
+	// Embedded UI. ServeMux's built-in /ui -> /ui/ redirect uses an absolute
+	// Location, which would drop a prefix-stripping reverse proxy's path
+	// prefix; this exact-match route keeps it relative instead (308 preserves
+	// the method).
+	register("/ui", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectRelative(w, "ui/", http.StatusPermanentRedirect)
+	}))
 	register("GET /ui/", http.HandlerFunc(s.handleUI))
+	// The browser fetches the web app manifest - and the icons it references -
+	// itself while deciding whether to offer installing the PWA, and it has no
+	// way to attach an API key to those requests. Serve them without auth so
+	// the install prompt isn't silently lost behind a 401 when apiKeys is set
+	// (issue #1175).
+	for _, name := range []string{
+		"site.webmanifest",
+		"web-app-manifest-192x192.png",
+		"web-app-manifest-512x512.png",
+	} {
+		register("GET /ui/"+name, http.HandlerFunc(s.handleUI))
+	}
 	register("GET /favicon.ico", http.HandlerFunc(s.handleFavicon))
 
 	// Prometheus metrics are administrative because they expose host activity.
@@ -469,6 +510,11 @@ func (s *Server) routes() {
 	register("/comfyui", http.HandlerFunc(handleComfyUIRedirect))
 	register("/comfyui/{comfyPath...}", http.HandlerFunc(s.handleComfyUI))
 
+	// audio.cpp UI passthrough. This uses the fixed audiocpp_auto model so
+	// requests do not have to name a model.
+	register("/audiocpp", http.HandlerFunc(handleAudioCppRedirect))
+	register("/audiocpp/{audioCppPath...}", http.HandlerFunc(s.handleAudioCpp))
+
 	// API group consumed by the administrative UI.
 	register("POST /api/models/unload", http.HandlerFunc(s.handleAPIUnloadAll))
 	register("POST /api/models/unload/{model...}", http.HandlerFunc(s.handleAPIUnloadModel))
@@ -476,6 +522,7 @@ func (s *Server) routes() {
 	register("PUT /api/profiles/active", http.HandlerFunc(s.handleAPIActiveProfile))
 	register("POST /api/inflight/{id}/cancel", http.HandlerFunc(s.handleAPICancelInflight))
 	register("GET /api/events", http.HandlerFunc(s.handleAPIEvents))
+	register("GET /api/events/logs", http.HandlerFunc(s.handleAPILogEvents))
 	register("GET /api/metrics/activity", http.HandlerFunc(s.handleAPIActivity))
 	register("GET /api/metrics/stats", http.HandlerFunc(s.handleAPIActivityStats))
 	register("GET /api/performance", http.HandlerFunc(s.handleAPIPerformance))
@@ -486,7 +533,7 @@ func (s *Server) routes() {
 	register("GET /api/tailcat", http.HandlerFunc(s.handleAPITailcat))
 
 	s.mux = mux
-	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware(s.cfg)).Then(mux)
+	s.handler = chain.New(CreateRequestLogMiddleware(s.logs.HttpLogs), CreateCORSMiddleware(s.cfg)).Then(mux)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +572,12 @@ func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if inference && r.Method != http.MethodOptions {
+		// Normalize first so the model lookup sees the same body format the
+		// model chain will.
+		if bodyErr := prepareModelBody(w, r); bodyErr != nil {
+			http.NotFound(w, r)
+			return
+		}
 		model, err := swaputil.ExtractModel(r)
 		if err != nil || !tailcatModelAllowed(tc.Models, model) {
 			http.NotFound(w, r)
