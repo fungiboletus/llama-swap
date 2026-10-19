@@ -401,6 +401,151 @@ models:
 	}
 }
 
+// managedGenerateTestServer wires a Server whose only model is an
+// Ollama-managed lane answering /api/generate with handler.
+func managedGenerateTestServer(t *testing.T, handler http.HandlerFunc) *Server {
+	t.Helper()
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  native:
+    cmd: server --port ${PORT}
+    aliases: [alias]
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	model := cfg.Models["native"]
+	model.OllamaManaged = true
+	cfg.Models["native"] = model
+
+	local := newStubRouter([]string{"native"}, "")
+	local.serveHTTP = handler
+	return newOllamaAPITestServer(t, cfg, local)
+}
+
+func TestOllamaAPI_ManagedGenerateRecordsActivity(t *testing.T) {
+	s := managedGenerateTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"native","response":"e4","done":true,` +
+			`"total_duration":1500000000,"prompt_eval_count":40,"prompt_eval_duration":400000000,` +
+			`"eval_count":10,"eval_duration":500000000}` + "\n"))
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(`{"model":"alias","prompt":"1.","stream":false}`))
+	r.Header.Set("X-Authenticated-User", "alice@example.com")
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"response":"e4"`) {
+		t.Fatalf("client response changed: status=%d body=%q", w.Code, w.Body.String())
+	}
+
+	entries := metricsEntries(t, s.metrics)
+	if len(entries) != 1 {
+		t.Fatalf("activity entries = %d, want 1", len(entries))
+	}
+	entry := entries[0]
+	if entry.Model != "native" || entry.ReqPath != "/api/generate" || entry.AuthenticatedUser != "alice@example.com" {
+		t.Errorf("activity entry = %#v", entry)
+	}
+	if entry.Tokens.InputTokens != 40 || entry.Tokens.OutputTokens != 10 {
+		t.Errorf("tokens = %+v, want input=40 output=10", entry.Tokens)
+	}
+	if entry.Tokens.PromptPerSecond != 100 || entry.Tokens.TokensPerSecond != 20 {
+		t.Errorf("rates = prompt %v, generation %v; want 100 and 20", entry.Tokens.PromptPerSecond, entry.Tokens.TokensPerSecond)
+	}
+	if entry.DurationMs < 1500 {
+		t.Errorf("duration = %dms, want at least the reported 1500ms", entry.DurationMs)
+	}
+}
+
+func TestOllamaAPI_ManagedGenerateRecordsStreamingActivity(t *testing.T) {
+	s := managedGenerateTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"model":"native","response":"e","done":false}` + "\n" +
+			`{"model":"native","response":"4","done":false}` + "\n" +
+			`{"model":"native","response":"","done":true,"total_duration":900000000,` +
+			`"prompt_eval_count":8,"prompt_eval_duration":100000000,"eval_count":2,"eval_duration":200000000}` + "\n"))
+	})
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(`{"model":"native","prompt":"1."}`)))
+	if w.Code != http.StatusOK || strings.Count(w.Body.String(), "\n") != 3 {
+		t.Fatalf("client stream changed: status=%d body=%q", w.Code, w.Body.String())
+	}
+
+	entries := metricsEntries(t, s.metrics)
+	if len(entries) != 1 {
+		t.Fatalf("activity entries = %d, want 1", len(entries))
+	}
+	if tokens := entries[0].Tokens; tokens.InputTokens != 8 || tokens.OutputTokens != 2 || tokens.TokensPerSecond != 10 {
+		t.Errorf("tokens = %+v, want input=8 output=2 at 10 tokens/s", tokens)
+	}
+}
+
+func TestOllamaAPI_ManagedGenerateRecordsOllamaError(t *testing.T) {
+	s := managedGenerateTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"error":"model runner has unexpectedly stopped"}` + "\n"))
+	})
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(`{"model":"native","prompt":"1."}`)))
+
+	entries := metricsEntries(t, s.metrics)
+	if len(entries) != 1 {
+		t.Fatalf("activity entries = %d, want 1", len(entries))
+	}
+	if entries[0].ErrorMsg != "model runner has unexpectedly stopped" {
+		t.Errorf("error message = %q", entries[0].ErrorMsg)
+	}
+}
+
+func TestOllamaAPI_ProcessOllamaResponse(t *testing.T) {
+	start := time.Now()
+
+	t.Run("prompt served from cache has no prompt rate", func(t *testing.T) {
+		entry, errMsg, err := processOllamaResponse("m", start,
+			[]byte(`{"done":true,"eval_count":5,"eval_duration":1000000000}`))
+		if err != nil || errMsg != "" {
+			t.Fatalf("err=%v errMsg=%q", err, errMsg)
+		}
+		if entry.Tokens.InputTokens != 0 || entry.Tokens.PromptPerSecond != -1 {
+			t.Errorf("tokens = %+v, want no input and unknown prompt rate", entry.Tokens)
+		}
+		if entry.Tokens.OutputTokens != 5 || entry.Tokens.TokensPerSecond != 5 {
+			t.Errorf("tokens = %+v, want 5 tokens at 5/s", entry.Tokens)
+		}
+	})
+
+	t.Run("single token has no generation rate", func(t *testing.T) {
+		entry, _, err := processOllamaResponse("m", start,
+			[]byte(`{"done":true,"eval_count":1,"eval_duration":1000,"prompt_eval_count":10,"prompt_eval_duration":20000000}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.Tokens.OutputTokens != 1 || entry.Tokens.TokensPerSecond != -1 {
+			t.Errorf("tokens = %+v, want 1 output token and unknown generation rate", entry.Tokens)
+		}
+		if entry.Tokens.PromptPerSecond != 500 {
+			t.Errorf("prompt rate = %v, want 500", entry.Tokens.PromptPerSecond)
+		}
+	})
+
+	t.Run("pretty printed single object", func(t *testing.T) {
+		entry, _, err := processOllamaResponse("m", start,
+			[]byte("{\n  \"done\": true,\n  \"eval_count\": 3,\n  \"prompt_eval_count\": 4\n}\n"))
+		if err != nil || entry.Tokens.InputTokens != 4 || entry.Tokens.OutputTokens != 3 {
+			t.Errorf("entry=%+v err=%v", entry.Tokens, err)
+		}
+	})
+
+	t.Run("no final object", func(t *testing.T) {
+		if _, _, err := processOllamaResponse("m", start, []byte(`{"response":"x","done":false}`+"\n")); err == nil {
+			t.Error("expected an error when the stream never finished")
+		}
+	})
+}
+
 func TestOllamaAPI_EmptyToolsAreNotToolCalls(t *testing.T) {
 	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
 models:

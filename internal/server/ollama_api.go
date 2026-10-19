@@ -278,6 +278,9 @@ func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 // isolated Ollama lanes. llama-swap remains responsible for choosing and
 // keeping the process resident, so keep_alive is deliberately not forwarded.
 func (s *Server) serveManagedOllamaGenerate(w http.ResponseWriter, r *http.Request, target ollamaModelTarget) {
+	// The native request is forwarded as is, so it is the request to capture.
+	captureFields, reqBody, reqHeaders := s.captureOllamaActivityRequest(r)
+
 	var body map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		sendOllamaError(w, http.StatusBadRequest, "invalid Ollama request")
@@ -310,7 +313,20 @@ func (s *Server) serveManagedOllamaGenerate(w http.ResponseWriter, r *http.Reque
 		Streaming: requestStreams(body),
 		Metadata:  make(map[string]string),
 	}))
-	s.local.ServeHTTP(w, translated)
+	// Keep the response parseable for the activity log, as the metrics
+	// middleware does for model-dispatched routes.
+	if ae := translated.Header.Get("Accept-Encoding"); ae != "" {
+		translated.Header.Set("Accept-Encoding", filterAcceptEncoding(ae))
+	}
+
+	if s.metrics == nil {
+		s.local.ServeHTTP(w, translated)
+		return
+	}
+	recorder := newBodyCopier(w)
+	s.local.ServeHTTP(recorder, translated)
+	swaputil.MarkClientClosed(recorder, r)
+	s.metrics.recordOllama(target.localID, r, recorder, captureFields, reqBody, reqHeaders)
 }
 
 func requestStreams(body map[string]json.RawMessage) bool {

@@ -134,14 +134,33 @@ func activitySource(r *http.Request) string {
 	return "ip:" + host
 }
 
+// responseFormat names the wire format of a buffered upstream response.
+type responseFormat uint8
+
+const (
+	// formatJSON is a single JSON document, usually OpenAI-compatible.
+	formatJSON responseFormat = iota
+	// formatSSE is an upstream server-sent-events stream.
+	formatSSE
+	// formatOllama is a native Ollama response: one JSON object, or NDJSON
+	// when streamed, whose final object carries the eval counts and durations.
+	formatOllama
+)
+
 func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
-	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, false)
+	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, formatJSON)
 }
 
 // recordStreaming records an upstream SSE response whose client-facing
 // representation was converted to a non-SSE format before reaching the caller.
 func (mp *metricsMonitor) recordStreaming(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
-	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, true)
+	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, formatSSE)
+}
+
+// recordOllama records a response that was proxied unmodified from a managed
+// Ollama lane, so it is in Ollama's native format rather than OpenAI's.
+func (mp *metricsMonitor) recordOllama(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+	mp.recordResponse(modelID, r, recorder, cf, reqBody, reqHeaders, formatOllama)
 }
 
 // recordResponse parses a completed response body and stores/emits an activity entry.
@@ -150,7 +169,7 @@ func (mp *metricsMonitor) recordStreaming(modelID string, r *http.Request, recor
 // request only and set ErrorMsg to a description of the failure, so the error
 // can be inspected without storing unreadable raw response bytes. reqBody and
 // reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) recordResponse(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, upstreamStreaming bool) {
+func (mp *metricsMonitor) recordResponse(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, format responseFormat) {
 	tm := ActivityLogEntry{
 		Timestamp:         time.Now(),
 		Model:             modelID,
@@ -230,7 +249,18 @@ func (mp *metricsMonitor) recordResponse(modelID string, r *http.Request, record
 		body = decoded
 	}
 
-	if upstreamStreaming || strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
+	if format == formatOllama {
+		parsed, errMsg, err := processOllamaResponse(modelID, recorder.StartTime(), body)
+		switch {
+		case err != nil:
+			mp.logger.Warnf("error processing Ollama response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
+		case errMsg != "":
+			tm.ErrorMsg = errMsg
+		default:
+			tm.Tokens = parsed.Tokens
+			tm.DurationMs = parsed.DurationMs
+		}
+	} else if format == formatSSE || strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
 		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
@@ -501,6 +531,75 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 	}
 
 	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, usage, timings, responseMetrics), nil
+}
+
+// processOllamaResponse reads the counts and timings from a native Ollama
+// /api/generate response: either one JSON object or NDJSON, where the object
+// with "done": true closes the stream. Ollama reports durations in
+// nanoseconds, and omits prompt_eval_count when it served the prompt from its
+// cache, in which case no prompt rate can be derived. An error object that
+// arrives instead of a final one is returned as errMsg.
+func processOllamaResponse(modelID string, start time.Time, body []byte) (entry ActivityLogEntry, errMsg string, err error) {
+	var final, failure gjson.Result
+	scan := func(obj gjson.Result) {
+		if !obj.IsObject() {
+			return
+		}
+		if obj.Get("done").Bool() {
+			final = obj
+		}
+		if e := obj.Get("error"); e.Exists() && e.Type == gjson.String {
+			failure = obj
+		}
+	}
+	if gjson.ValidBytes(body) {
+		scan(gjson.ParseBytes(body))
+	} else {
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if len(line) > 0 && gjson.ValidBytes(line) {
+				scan(gjson.ParseBytes(line))
+			}
+		}
+	}
+
+	if !final.Exists() {
+		if failure.Exists() {
+			return ActivityLogEntry{}, strings.TrimSpace(failure.Get("error").String()), nil
+		}
+		return ActivityLogEntry{}, "", fmt.Errorf("no final Ollama object found")
+	}
+
+	input := final.Get("prompt_eval_count").Int()
+	output := final.Get("eval_count").Int()
+	promptPerSecond, tokensPerSecond := -1.0, -1.0
+	if ns := final.Get("prompt_eval_duration").Float(); input > 0 && ns > 0 {
+		promptPerSecond = float64(input) / (ns / 1e9)
+	}
+	// A single token has no interval to measure: Ollama reports a near-zero
+	// eval_duration for it, which would yield an absurd rate.
+	if ns := final.Get("eval_duration").Float(); output > 1 && ns > 0 {
+		tokensPerSecond = float64(output) / (ns / 1e9)
+	}
+	durationMs := int(time.Since(start).Milliseconds())
+	if total := int(final.Get("total_duration").Float() / 1e6); total > durationMs {
+		durationMs = total
+	}
+
+	return ActivityLogEntry{
+		Timestamp: time.Now(),
+		Model:     modelID,
+		Tokens: TokenMetrics{
+			CachedTokens:    -1,
+			DraftTokens:     -1,
+			DraftAccTokens:  -1,
+			InputTokens:     int(input),
+			OutputTokens:    int(output),
+			PromptPerSecond: promptPerSecond,
+			TokensPerSecond: tokensPerSecond,
+		},
+		DurationMs: durationMs,
+	}, "", nil
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics gjson.Result) (ActivityLogEntry, error) {
