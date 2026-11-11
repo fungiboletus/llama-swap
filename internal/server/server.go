@@ -492,8 +492,13 @@ func (s *Server) routes() {
 		}
 		switch access {
 		case routeInference:
-			if concurrencyMW != nil && (pattern == "POST /api/chat" || pattern == "POST /api/generate") {
-				handler = concurrencyMW(handler)
+			if pattern == "POST /api/chat" || pattern == "POST /api/generate" {
+				// Innermost, like the model chain: requests waiting on the
+				// concurrency limit are not in flight yet.
+				handler = CreateOllamaInflightMiddleware(s.inflight)(handler)
+				if concurrencyMW != nil {
+					handler = concurrencyMW(handler)
+				}
 			}
 			handler = inferenceAuthMW(handler)
 		case routeAdmin:

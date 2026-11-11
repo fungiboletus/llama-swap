@@ -120,6 +120,19 @@ func (t *inflightTracker) Remove(id string) {
 	t.mu.Unlock()
 }
 
+// SetModel records the model a request resolved to, for requests that are
+// tracked before their model is known (the Ollama-native endpoints).
+func (t *inflightTracker) SetModel(id, model string) {
+	t.mu.Lock()
+	req, ok := t.requests[id]
+	if ok && req.entry.Model != model {
+		req.entry.Model = model
+		req.lastEmitted = time.Now()
+		t.enqueueLocked(upsertInflightEvent(req.entry))
+	}
+	t.mu.Unlock()
+}
+
 func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
 	values := headerMap(headers)
 	redactHeaders(values)
@@ -462,4 +475,36 @@ func isModelDispatchedRequest(method, path string) bool {
 		}
 	}
 	return false
+}
+
+type inflightIDContextKey struct{}
+
+// CreateOllamaInflightMiddleware tracks the Ollama-native /api/chat and
+// /api/generate endpoints. They decode their own body and resolve the model
+// themselves instead of going through the model-dispatch chain, so the request
+// is tracked from the start and the handler names its model with
+// trackOllamaModel once it is known.
+func CreateOllamaInflightMiddleware(t *inflightTracker) chain.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r = markInflightStart(r)
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+
+			r = r.WithContext(ctx)
+			id := t.Add(r, cancel)
+			defer t.Remove(id)
+
+			r = r.WithContext(context.WithValue(r.Context(), inflightIDContextKey{}, id))
+			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
+		})
+	}
+}
+
+// trackOllamaModel names the model of a request tracked by
+// CreateOllamaInflightMiddleware.
+func (s *Server) trackOllamaModel(r *http.Request, model string) {
+	if id, ok := r.Context().Value(inflightIDContextKey{}).(string); ok {
+		s.inflight.SetModel(id, model)
+	}
 }

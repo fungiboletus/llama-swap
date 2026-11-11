@@ -196,6 +196,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotFound, "model not found")
 		return
 	}
+	s.trackOllamaModel(r, target.localID)
 	if hasOllamaTools(request.Tools) {
 		sendOllamaError(w, http.StatusNotImplemented, "tools are not supported for local Ollama compatibility")
 		return
@@ -236,6 +237,7 @@ func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 		sendOllamaError(w, http.StatusNotFound, "model not found")
 		return
 	}
+	s.trackOllamaModel(r, target.localID)
 	modelConfig := s.cfg.Models[target.localID]
 	if modelConfig.OllamaManaged {
 		// A managed lane is an isolated Ollama server. Let it interpret the

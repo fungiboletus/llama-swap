@@ -13,6 +13,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/ollamaapi"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 func newOllamaAPITestServer(t *testing.T, cfg config.Config, local *stubRouter) *Server {
@@ -1096,6 +1097,46 @@ models:
 			}
 			if len(reached) != 0 {
 				t.Errorf("model must not be loaded by a stop request, got %v", reached)
+			}
+		})
+	}
+}
+
+// The Ollama-native endpoints decode their own body instead of going through
+// the model-dispatch chain, so they must be tracked as in-flight on their own.
+func TestOllamaAPI_NativeEndpointsAreTrackedInFlight(t *testing.T) {
+	for _, path := range []string{"/api/generate", "/api/chat"} {
+		t.Run(path, func(t *testing.T) {
+			var during swaputil.InFlightRequestsEvent
+			var s *Server
+			s = managedGenerateTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				during = s.inflight.Current()
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/v1/chat/completions" {
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"model":"native","response":"x","done":true}` + "\n"))
+			})
+
+			body := `{"model":"alias","prompt":"hi","stream":false}`
+			if path == "/api/chat" {
+				body = `{"model":"alias","messages":[{"role":"user","content":"hi"}],"stream":false}`
+			}
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %q", w.Code, w.Body.String())
+			}
+
+			if len(during.Requests) != 1 {
+				t.Fatalf("in-flight during request = %d, want 1", len(during.Requests))
+			}
+			if got := during.Requests[0]; got.ReqPath != path || got.Model != "native" {
+				t.Errorf("in-flight entry = path %q model %q, want %q and native", got.ReqPath, got.Model, path)
+			}
+			if after := s.inflight.Current(); len(after.Requests) != 0 {
+				t.Errorf("in-flight after request = %+v, want empty", after.Requests)
 			}
 		})
 	}
