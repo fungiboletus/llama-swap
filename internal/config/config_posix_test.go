@@ -217,6 +217,7 @@ groups:
 		StallTimeout:     DEFAULT_STALL_TIMEOUT,
 		RequestTimeout:   DEFAULT_REQUEST_TIMEOUT,
 		MaxTokens:        DEFAULT_MAX_TOKENS,
+		MaxRequestBodyMB: DEFAULT_MAX_REQUEST_BODY_MB,
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",

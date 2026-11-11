@@ -11,6 +11,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// LoadConfigFromReader expands macros, applies defaults, and validates the
+// configuration, normalizing legacy and selected router settings.
 func LoadConfigFromReader(r io.Reader) (Config, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -49,6 +51,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		StallTimeout:       DEFAULT_STALL_TIMEOUT,
 		RequestTimeout:     DEFAULT_REQUEST_TIMEOUT,
 		MaxTokens:          DEFAULT_MAX_TOKENS,
+		MaxRequestBodyMB:   DEFAULT_MAX_REQUEST_BODY_MB,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
@@ -105,10 +108,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("globalConcurrencyLimit must be >= 0")
 	}
 
+	if config.MaxRequestBodyMB < 1 {
+		return Config{}, fmt.Errorf("maxRequestBodyMB must be >= 1")
+	}
+
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
 
 	if config.Store != nil {
-		if err := validateStorePath(config.Store.Path); err != nil {
+		if err := validateStore(config.Store); err != nil {
 			return Config{}, err
 		}
 	}
@@ -181,6 +188,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if err := modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}
+		if err := validateUnhealthyResponses(modelConfig.UnhealthyResponses); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+		if err := validateModelCapacity(modelConfig); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
 
 		// Auto-register setParamsByID keys as aliases (skip the model's own ID)
 		for key := range modelConfig.Filters.SetParamsByID {
@@ -219,19 +232,23 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// Normalize routing config. The legacy top-level `matrix`/`groups` keys and
 	// the new `routing.router` block are mutually exclusive: a config may use
 	// either style, never both.
-	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0
+	hasTopLevel := config.Matrix != nil || config.Groups != nil
 	rtr := config.Routing.Router
-	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0 || rtr.Settings.Auto != nil
+	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0 || rtr.Settings.Capacity != nil || rtr.Settings.Auto != nil
 
 	if hasTopLevel && hasRouting {
 		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
 	}
 
 	if !hasTopLevel {
-		// Both groups and matrix may be defined under routing.router.settings;
+		// Multiple engines may be defined under routing.router.settings;
 		// routing.router.use selects which one is active, so there is no conflict.
 		rs := config.Routing.Router.Settings
 		switch config.Routing.Router.Use {
+		case "capacity":
+			if err := ValidateCapacity(rs.Capacity, config.Models); err != nil {
+				return Config{}, fmt.Errorf("routing.router.settings.capacity: %w", err)
+			}
 		case "matrix":
 			if rs.Matrix == nil {
 				return Config{}, fmt.Errorf("routing.router.use is 'matrix' but routing.router.settings.matrix is not set")
@@ -244,7 +261,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("routing.router.use is 'auto' but routing.router.settings.auto is not set")
 			}
 		default:
-			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, auto)", config.Routing.Router.Use)
+			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, capacity, auto)", config.Routing.Router.Use)
 		}
 	}
 
@@ -257,7 +274,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if err := ValidateMatrix(config.Matrix, config.Models); err != nil {
 			return Config{}, fmt.Errorf("matrix: %w", err)
 		}
-	} else if config.Routing.Router.Use != "auto" {
+	} else if config.Routing.Router.Use != "auto" && rtr.Use != "capacity" {
 		config = AddDefaultGroupToConfig(config)
 
 		// Validate group members
@@ -287,7 +304,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		}
 	} else if config.Matrix != nil {
 		config.Routing.Router.Use = "matrix"
-	} else {
+	} else if rtr.Use != "capacity" {
 		config.Routing.Router.Use = "group"
 	}
 	config.Routing.Router.Settings.Matrix = config.Matrix
@@ -471,4 +488,19 @@ func resolveInherited(modelValue, globalValue int) int {
 	default:
 		return modelValue
 	}
+}
+
+// validateStore checks the store section: store.path must be a writable file
+// location, and so must the captures file derived from it when captures are
+// persisted.
+func validateStore(st *Store) error {
+	if err := validateStorePath("store.path", strings.TrimSpace(st.Path)); err != nil {
+		return err
+	}
+	if capturesPath := st.CapturesPath(); capturesPath != "" {
+		if err := validateStorePath("store.persistCaptures", capturesPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }

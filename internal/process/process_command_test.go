@@ -238,11 +238,14 @@ func TestProcessCommand_ReverseProxyRewritesHost(t *testing.T) {
 
 	receivedHost := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
-			return
+		// Startup detection probes other paths; only the proxied request
+		// is of interest here.
+		if r.URL.Path == "/v1/chat/completions" {
+			select {
+			case receivedHost <- r.Host:
+			default:
+			}
 		}
-		receivedHost <- r.Host
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(upstream.Close)
@@ -777,7 +780,8 @@ func TestProcessCommand_TTL_IgnoresWebsocket(t *testing.T) {
 	websocketStarted := make(chan struct{})
 	releaseWebsocket := make(chan struct{})
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
+		if r.URL.Path != "/socket" {
+			// /health, and the upstream detection that runs before ready.
 			w.WriteHeader(http.StatusOK)
 			return
 		}

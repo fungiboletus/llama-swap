@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -460,18 +459,19 @@ func TestServer_APIMetricsActivity_Empty(t *testing.T) {
 func TestServer_APIMetricsActivity(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.metrics.enableCaptures = true
-	s.metrics.captureCache = cache.New(1024 * 1024)
+	s.metrics.maxCaptureBytes = 1024 * 1024
 
 	storedM1, ok := s.metrics.queueMetrics(ActivityLogEntry{
 		Timestamp: time.Unix(1, 0),
 		Model:     "m1",
 		ReqPath:   "/v1/chat/completions",
 		Tokens:    TokenMetrics{InputTokens: 1, OutputTokens: 2},
+		CaptureID: s.metrics.newCaptureID(time.Unix(1, 0)),
 	})
 	if !ok {
 		t.Fatal("queueMetrics m1 failed")
 	}
-	if ok := s.metrics.addCapture(ReqRespCapture{ID: storedM1.ID, ReqPath: "/v1/chat/completions"}); !ok {
+	if ok := s.metrics.addCapture(storedM1.CaptureID, ReqRespCapture{ID: storedM1.ID, ReqPath: "/v1/chat/completions"}); !ok {
 		t.Fatal("addCapture failed")
 	}
 	if _, ok := s.metrics.queueMetrics(ActivityLogEntry{
@@ -495,7 +495,7 @@ func TestServer_APIMetricsActivity(t *testing.T) {
 	if page.Total != 1 || len(page.Data) != 1 {
 		t.Fatalf("page = %+v", page)
 	}
-	if page.Data[0].ID != storedM1.ID || !page.Data[0].HasCapture {
+	if page.Data[0].ID != storedM1.ID || page.Data[0].CaptureID != storedM1.CaptureID || !page.Data[0].HasCapture {
 		t.Fatalf("entry = %+v", page.Data[0])
 	}
 }
@@ -684,6 +684,7 @@ func TestServer_APIPerformance_Unavailable(t *testing.T) {
 func TestServer_APIEvents_InitialPayload(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.cfg.UI.Activity.SessionID = []string{"X-Trace-ID"}
+	s.cfg.HelpAgent.Disable = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
@@ -704,7 +705,7 @@ func TestServer_APIEvents_InitialPayload(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	for _, want := range []string{`"type":"modelStatus"`, `"type":"inflight"`, `"type":"uiConfig"`, `"type":"profileChanged"`, `X-Trace-ID`} {
+	for _, want := range []string{`"type":"modelStatus"`, `"type":"inflight"`, `"type":"uiConfig"`, `"type":"profileChanged"`, `"type":"pauseChanged"`, `X-Trace-ID`, `\"helpagent\":{\"disable\":true}`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("initial SSE payload missing %s; body=%q", want, body)
 		}

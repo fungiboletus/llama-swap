@@ -106,7 +106,9 @@ type Effects interface {
 	// set it hands the Swapper.
 	RunningModels() map[string]process.ProcessState
 	// StartSwap launches the swap goroutine for modelID, stopping evict first.
-	StartSwap(modelID string, evict []string)
+	// Its result identifies this generation. The returned function cancels the
+	// swap and blocks until it exits, without needing OnSwapDone to run.
+	StartSwap(modelID string, generation uint64, evict []string) func()
 	// GrantError responds to a caller with an error.
 	GrantError(req HandlerReq, err error)
 	// GrantServe hands a caller the wrapped handler for modelID and reports
@@ -153,6 +155,7 @@ type HandlerResp struct {
 // SwapDone is reported by a swap goroutine when its target is ready (or failed).
 type SwapDone struct {
 	ModelID      string
+	Generation   uint64
 	Err          error
 	LoadDuration time.Duration
 }

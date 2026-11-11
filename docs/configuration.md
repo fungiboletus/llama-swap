@@ -274,6 +274,14 @@ models:
     cmd: ...
     # this one legitimately thinks for a long time before its first token
     stallTimeout: 1800
+
+  mlx-model:
+    cmd: ...
+    # a server that stays up but answers with a known "I am broken" error:
+    # the caller gets that error, the model is stopped, the next request restarts it
+    unhealthyResponses:
+      - status: 404
+        bodyContains: generation thread died
 ```
 
 **`maxTokens`** (default 8192) is the first and cheapest line of defence: the

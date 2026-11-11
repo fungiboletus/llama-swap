@@ -2,9 +2,8 @@
 #
 # Runs the Docs Agent eval against a llama-swap built from the working tree.
 #
-# The server has to be built from this branch: /api/mcp does not exist in
-# releases, and docs/kb is compiled in by //go:embed, so a KB edit is only
-# visible after a rebuild. Everything the agent model needs comes through the
+# The server has to be built from this branch: docs/kb is compiled in by
+# //go:embed, so a KB edit is only visible after a rebuild. Everything the agent model needs comes through the
 # same server, via peers, so there is only ever one base URL.
 #
 # The server is started with fixture/ merged in through -config-dir. That is
@@ -61,13 +60,16 @@ if [[ -z "$BASE_URL" ]]; then
   fi
 
   echo "==> building llama-swap"
+  # embed_src gives the agent its code__* tools; copying the source takes
+  # well under a second.
+  make src >/dev/null
   if [[ "$EMBED_UI" == "1" ]]; then
     make ui >/dev/null
-    go build -tags embed_ui -o build/llama-swap .
+    go build -tags embed_ui,embed_src -o build/llama-swap .
   else
     # No embed_ui: the eval never loads the UI, and skipping it keeps a
     # rebuild-per-iteration down to a few seconds.
-    go build -o build/llama-swap .
+    go build -tags embed_src -o build/llama-swap .
   fi
 
   echo "==> starting llama-swap on 127.0.0.1:$PORT with $FIXTURE_DIR merged in"
@@ -103,7 +105,7 @@ fi
 
 echo "==> $BASE_URL is up; running eval with $MODEL"
 cd ui
-exec npm run --silent agent -- eval \
+npm run --silent agent -- eval \
   --base-url "$BASE_URL" \
   --model "$MODEL" \
   --concurrency "$CONCURRENCY" \

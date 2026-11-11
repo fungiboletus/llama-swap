@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -35,6 +36,7 @@ const DEFAULT_MAX_TOKENS = 8192
 // A negative value means "off for this model", which is how a model opts out
 // of a global limit. Both are normalized away by LoadConfigFromReader.
 const INHERIT_GLOBAL = 0
+const DEFAULT_MAX_REQUEST_BODY_MB = 250
 const (
 	LogToStdoutProxy    = "proxy"
 	LogToStdoutUpstream = "upstream"
@@ -167,8 +169,30 @@ type HookOnStartup struct {
 	Profile string   `yaml:"profile"`
 }
 
+// Store configures where llama-swap persists data.
 type Store struct {
+	// Path is the SQLite database file for activity logs.
 	Path string `yaml:"path"`
+	// PersistCaptures keeps request/response captures in a second SQLite
+	// file next to Path; see CapturesPath. When false, captures are kept in
+	// memory. Their total size is bounded by captureBuffer either way.
+	PersistCaptures bool `yaml:"persistCaptures"`
+}
+
+// CapturesPath returns the captures database file for this store, or "" when
+// captures are not persisted. It is derived from Path so the two files always
+// travel together: /path/to/metrics.db stores captures in
+// /path/to/metrics_captures.db.
+func (s *Store) CapturesPath() string {
+	if s == nil || !s.PersistCaptures {
+		return ""
+	}
+	path := strings.TrimSpace(s.Path)
+	if path == "" {
+		return ""
+	}
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + "_captures" + ext
 }
 
 type UIConfig struct {
@@ -177,6 +201,12 @@ type UIConfig struct {
 
 type UIActivityConfig struct {
 	SessionID []string `yaml:"session_id" json:"session_id"`
+}
+
+// HelpAgentConfig controls the UI's Help page and the /api/mcp endpoint that
+// serves its tools.
+type HelpAgentConfig struct {
+	Disable bool `yaml:"disable" json:"disable"`
 }
 
 // ProfileConfig describes a runtime-selectable set of model ID rewrites.
@@ -213,6 +243,7 @@ type Config struct {
 	Store              *Store            `yaml:"store"`
 	UI                 UIConfig          `yaml:"ui"`
 	Performance        PerformanceConfig `yaml:"performance"`
+	HelpAgent          HelpAgentConfig   `yaml:"helpagent"`
 	GlobalTTL          int               `yaml:"globalTTL"`
 	UnloadTimeout      int               `yaml:"unloadTimeout"`
 
@@ -238,6 +269,10 @@ type Config struct {
 	// GlobalConcurrencyLimit caps the number of inference requests served at
 	// once across all models. 0 (default) means no limit. See issue #1086.
 	GlobalConcurrencyLimit int `yaml:"globalConcurrencyLimit"`
+
+	// MaxRequestBodyMB caps the size, in megabytes, of request bodies on
+	// model-dispatched POSTs. Larger requests get HTTP 413.
+	MaxRequestBodyMB int `yaml:"maxRequestBodyMB"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.
@@ -303,6 +338,16 @@ func (c Config) TailcatEnabled() bool {
 	return c.tailcatEnabled
 }
 
+// MaxRequestBodyBytes returns MaxRequestBodyMB in bytes. Configs not built by
+// LoadConfigFromReader leave MaxRequestBodyMB at 0 and get the default.
+func (c Config) MaxRequestBodyBytes() int64 {
+	mb := c.MaxRequestBodyMB
+	if mb <= 0 {
+		mb = DEFAULT_MAX_REQUEST_BODY_MB
+	}
+	return int64(mb) << 20
+}
+
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
 type RoutingConfig struct {
 	Scheduler SchedulerConfig `yaml:"scheduler"`
@@ -323,14 +368,15 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "auto"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "capacity" | "auto"
 	Settings RouterSettings `yaml:"settings"`
 }
 
 type RouterSettings struct {
-	Groups map[string]GroupConfig `yaml:"groups"`
-	Matrix *MatrixConfig          `yaml:"matrix"`
-	Auto   *AutoRouterConfig      `yaml:"auto"`
+	Groups   map[string]GroupConfig `yaml:"groups"`
+	Matrix   *MatrixConfig          `yaml:"matrix"`
+	Capacity *CapacityConfig        `yaml:"capacity"`
+	Auto     *AutoRouterConfig      `yaml:"auto"`
 }
 
 // AutoRouterConfig specifies the fixed memory pool used by the auto router.

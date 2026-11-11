@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   formatDuration,
   formatSpeed,
+  formatDecodeSpeed,
   formatFileSize,
   formatCapacity,
   formatRelativeTime,
@@ -110,5 +111,22 @@ describe("formatUptime", () => {
 
   it("clamps negative durations from clock skew to 0s", () => {
     expect(formatUptime(-5000)).toBe("0s");
+  });
+});
+
+describe("formatDecodeSpeed", () => {
+  const row = (tps: number, out: number, ms: number) => ({
+    duration_ms: ms,
+    tokens: { tokens_per_second: tps, output_tokens: out },
+  });
+  it("shows a reported rate as is", () => {
+    expect(formatDecodeSpeed(row(40, 100, 1000))).toBe("40.00 t/s");
+  });
+  it("estimates from duration with a ~ when unreported", () => {
+    expect(formatDecodeSpeed(row(-1, 100, 2000))).toBe("~50.00 t/s");
+  });
+  it("stays unknown without enough data", () => {
+    expect(formatDecodeSpeed(row(-1, 1, 2000))).toBe("unknown");
+    expect(formatDecodeSpeed(row(-1, 100, 0))).toBe("unknown");
   });
 });

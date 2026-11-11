@@ -4,7 +4,7 @@ summary: A verified llama-swap config that runs llama-server, sd-server, whisper
 category: examples
 tags: [kubeswap, kubernetes, multi-backend, sd-server, whisper-server, audiocpp_server, llama-server, pvc, gpu, exclusive-group, helm]
 config_keys: [models.*.cmd, models.*.cmdStop, models.*.proxy, models.*.capabilities, healthCheckTimeout, unloadTimeout, routing]
-updated: 2026-09-14
+updated: 2026-11-04
 ---
 
 # kubeswap: a complete multi-engine Kubernetes configuration
@@ -18,6 +18,9 @@ servers ship in **one image** (the unified llama-swap image), so every
 model below uses the same `--image` and only `--command` selects the
 server. This exact shape was verified end to end on a k3s cluster
 (request in, generated artifact out, `cmdStop` teardown).
+
+To have the chart generate the routing section instead of writing the matrix
+DSL by hand, see "Matrix router builder" in `guides/tools/kubeswap`.
 
 Prerequisites: a head-end deployment — the Helm chart in
 `cmd/kubeswap/chart/` is the standard path (below). The head-end
@@ -445,7 +448,7 @@ mostly sharing the same pool shape) stays a few lines; for a small fleet
 like this one, the hand-written matrix is about the same length and gives
 you full DSL control. Other builder shapes (`pools` for per-category
 budgets, `manual` for a verbatim pass-through) and the `exclusive:` option
-are documented in the kubeswap-kubernetes article and the chart README.
+are documented in the `guides/tools/kubeswap` article and the chart README.
 
 ## Talking to it
 
@@ -496,7 +499,7 @@ curl -s $LS/v1/audio/speech -H 'Content-Type: application/json' \
 
 ## Related
 
-- `guides/operations/kubeswap-kubernetes` — how the wrapper works,
+- `guides/tools/kubeswap` — how the wrapper works,
   lifecycle semantics, GPU/CPU resource mapping, hand-rolled RBAC
 - `guides/operations/debugging-backends` — the status → logs → kubectl
   failure chain and the symptom table

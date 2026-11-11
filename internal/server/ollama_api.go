@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/ollamaapi"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
@@ -326,7 +327,7 @@ func (s *Server) serveManagedOllamaGenerate(w http.ResponseWriter, r *http.Reque
 	recorder := newBodyCopier(w)
 	s.local.ServeHTTP(recorder, translated)
 	swaputil.MarkClientClosed(recorder, r)
-	s.metrics.recordOllama(target.localID, r, recorder, captureFields, reqBody, reqHeaders)
+	s.metrics.recordOllama(target.localID, hint.TaskChat, r, recorder, captureFields, reqBody, reqHeaders)
 }
 
 func requestStreams(body map[string]json.RawMessage) bool {
@@ -576,10 +577,10 @@ func (s *Server) recordOllamaActivity(modelID string, r *http.Request, recorder 
 	if streaming {
 		// ollamaStreamWriter replaces the client-facing SSE response with NDJSON,
 		// while recorder retains the original SSE body that carries final usage.
-		s.metrics.recordStreaming(modelID, r, recorder, fields, reqBody, reqHeaders)
+		s.metrics.recordStreaming(modelID, hint.TaskChat, r, recorder, fields, reqBody, reqHeaders)
 		return
 	}
-	s.metrics.record(modelID, r, recorder, fields, reqBody, reqHeaders)
+	s.metrics.record(modelID, hint.TaskChat, r, recorder, fields, reqBody, reqHeaders)
 }
 
 func copyOllamaLocalResponse(w http.ResponseWriter, response *http.Response, model string, generate bool) {

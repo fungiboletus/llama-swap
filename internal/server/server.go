@@ -17,9 +17,11 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/mcptools"
+	"github.com/mostlygeek/llama-swap/internal/mcptools/sourcecode"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -55,9 +57,10 @@ type Server struct {
 	// discovery; Service methods are nil-receiver safe.
 	capcompat *capcompat.Service
 
-	// capcompatCancel unsubscribes the process-state listener that drives
-	// discovery. The event dispatcher is process-wide, so a hot config reload
-	// would otherwise leave the retired Server probing alongside the new one.
+	// capcompatCancel unsubscribes the listener that stores what processes
+	// detect about their upstream. The event dispatcher is process-wide, so a
+	// hot config reload would otherwise leave the retired Server storing
+	// alongside the new one.
 	capcompatCancel context.CancelFunc
 
 	// tools is the MCP tool surface served at /api/mcp. Providers are
@@ -68,6 +71,10 @@ type Server struct {
 
 	profileMu     sync.RWMutex
 	activeProfile string
+
+	// pause rejects requests for local models while inference is paused. It
+	// is shared across the Server instances a hot config reload creates.
+	pause *PauseState
 
 	local router.LocalRouter
 	peer  router.Router
@@ -177,6 +184,10 @@ var modelGetRoutes = []string{
 	"/v1/audio/voices",
 	"/sdapi/v1/loras",
 	"/props",
+
+	// websocket upgrade, OpenAI Realtime API style (?model=..., or the
+	// model named by the first session.update event)
+	"/v1/realtime",
 }
 
 // routeAccess determines which key set, if any, a route requires. Keeping this
@@ -217,7 +228,7 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 	case "GET /logs", "GET /logs/stream", "GET /logs/stream/{logMonitorID...}",
 		"GET /ui/", "GET /metrics", "GET /unload", "GET /running", "GET /upstream",
 		"/upstream/{upstreamPath...}", "/comfyui", "/comfyui/{comfyPath...}",
-		"POST /api/models/unload", "POST /api/models/unload/{model...}", "GET /api/profiles",
+		"POST /api/models/unload", "POST /api/models/unload/{model...}", "POST /api/models/pause", "POST /api/models/resume", "GET /api/profiles",
 		"PUT /api/profiles/active", "POST /api/inflight/{id}/cancel", "GET /api/events",
 		"GET /api/events/logs", "/audiocpp", "/audiocpp/{audioCppPath...}",
 		"GET /api/metrics/activity", "GET /api/metrics/stats", "GET /api/performance",
@@ -229,25 +240,57 @@ func routeAccessForPattern(pattern string) (routeAccess, bool) {
 	}
 }
 
-// isMetricsRecordPath reports whether path is one of the model-dispatched
-// endpoints that the metrics middleware records in the activity log.
-func isMetricsRecordPath(path string) bool {
-	for _, p := range modelPostJSONRoutes {
-		if p == path {
-			return true
-		}
-	}
-	for _, p := range modelPostFormRoutes {
-		if p == path {
-			return true
-		}
-	}
-	for _, p := range modelGetRoutes {
-		if p == path {
-			return true
-		}
-	}
-	return false
+// meteredRoutes maps every endpoint the metrics middleware records to the
+// kind of inference it performs. A path is metered if and only if it is
+// listed here, so the table is both the gate and the task label. Listing-only
+// endpoints such as /v1/audio/voices, /props and /sdapi/v1/loras are left out.
+var meteredRoutes = map[string]hint.Task{
+	"/v1/chat/completions": hint.TaskChat,
+	"/v1/responses":        hint.TaskChat,
+	"/v1/completions":      hint.TaskChat,
+	"/v1/messages":         hint.TaskChat,
+	"/completion":          hint.TaskChat,
+	"/infill":              hint.TaskChat,
+
+	"/v1/embeddings": hint.TaskEmbedding,
+
+	"/rerank":       hint.TaskRerank,
+	"/reranking":    hint.TaskRerank,
+	"/v1/rerank":    hint.TaskRerank,
+	"/v1/reranking": hint.TaskRerank,
+
+	"/v1/messages/count_tokens": hint.TaskTokenCount,
+
+	"/v1/images/generations": hint.TaskImageGeneration,
+	"/sdapi/v1/txt2img":      hint.TaskImageGeneration,
+	"/v1/images/edits":       hint.TaskImageEdit,
+	"/sdapi/v1/img2img":      hint.TaskImageEdit,
+
+	"/v1/audio/speech":         hint.TaskSpeech,
+	"/v1/audio/transcriptions": hint.TaskTranscription,
+
+	"/v1/systemone":          hint.TaskDecision,
+	"/audioapi/v1/tasks/run": hint.TaskAudio,
+
+	// a websocket, recorded once per session when it closes
+	"/v1/realtime": hint.TaskRealtime,
+
+	// versionless routes, see issue #728
+	"/v/chat/completions":      hint.TaskChat,
+	"/v/responses":             hint.TaskChat,
+	"/v/completions":           hint.TaskChat,
+	"/v/messages":              hint.TaskChat,
+	"/v/messages/count_tokens": hint.TaskTokenCount,
+	"/v/embeddings":            hint.TaskEmbedding,
+	"/v/rerank":                hint.TaskRerank,
+	"/v/reranking":             hint.TaskRerank,
+}
+
+// meteredTask reports the task for a metered endpoint path, and whether the
+// path is metered at all.
+func meteredTask(path string) (hint.Task, bool) {
+	task, ok := meteredRoutes[path]
+	return task, ok
 }
 
 // BuildInfo carries version metadata surfaced by GET /api/version.
@@ -257,7 +300,16 @@ type BuildInfo struct {
 	Date    string
 }
 
-func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
+// New constructs the selected local router, peer router, and HTTP handlers
+// using the supplied configuration and shared services.
+//
+// code serves llama-swap's own source over MCP. It is built once by the caller
+// and shared across reloads, so its checkout is fetched once per process; nil
+// leaves the code__* tools out.
+//
+// pause is shared across reloads too, so a reload keeps inference paused; nil
+// starts a fresh, unpaused state.
+func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs, code *sourcecode.Provider, pause *PauseState) (*Server, error) {
 	if err := prepareOllamaModels(context.Background(), &cfg); err != nil {
 		return nil, fmt.Errorf("preparing Ollama models: %w", err)
 	}
@@ -265,6 +317,11 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 	var err error
 
 	switch cfg.Routing.Router.Use {
+	case "capacity":
+		local, err = router.NewCapacity(cfg, logs)
+		if err != nil {
+			return nil, fmt.Errorf("creating capacity router: %w", err)
+		}
 	case "matrix":
 		local, err = router.NewMatrix(cfg, logs)
 		if err != nil {
@@ -290,6 +347,12 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 	if st == nil {
 		return nil, fmt.Errorf("store is required")
 	}
+
+	if pause == nil {
+		pause = NewPauseState()
+	}
+	local.SetStartGate(pause.startGate)
+
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:           cfg,
@@ -302,21 +365,26 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 		hardware:      hardware,
 		reference:     refs,
 		activeProfile: cfg.Hooks.OnStartup.Profile,
+		pause:         pause,
 		local:         local,
 		peer:          peer,
 		shutdownCtx:   shutdownCtx,
 		shutdownFn:    shutdownFn,
 	}
 	s.capcompat = capcompat.New(st.Cache(), logs.ProxyLogs)
-	s.capcompatCancel = event.On(s.onProcessStateChange)
+	s.capcompatCancel = event.On(s.onUpstreamDetected)
 
 	// SysProvider is constructed here because this is where perf and hardware
 	// are in scope; wiring those in later is a change to internal/mcptools.
-	tools, err := mcptools.New(
+	providers := []mcptools.Provider{
 		docagent.NewDocsProvider(refs),
 		mcptools.NewSysProvider(nil),
 		config.NewConfigProvider(cfg),
-	)
+	}
+	if code != nil {
+		providers = append(providers, code)
+	}
+	tools, err := mcptools.New(providers...)
 	if err != nil {
 		return nil, fmt.Errorf("building the MCP tool registry: %w", err)
 	}
@@ -348,7 +416,7 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case s.local.Handles(data.ModelID):
 		s.logs.ProxyLogs.Debugf("dispatch: using local process for model: %s", data.ModelID)
-		s.local.ServeHTTP(w, r)
+		s.serveLocal(w, r)
 	case s.peer.Handles(data.ModelID):
 		s.logs.ProxyLogs.Debugf("dispatch: using peer for model: %s", data.ModelID)
 		s.peer.ServeHTTP(w, r)
@@ -396,7 +464,7 @@ func stripAudioAPIPrefix(r *http.Request) {
 func (s *Server) routes() {
 	inferenceAuthMW := CreateInferenceAuthMiddleware(s.cfg)
 	adminAuthMW := CreateAdminAuthMiddleware(s.cfg)
-	modelMWs := []chain.Middleware{inferenceAuthMW, createContentTypeMiddleware()}
+	modelMWs := []chain.Middleware{inferenceAuthMW, createContentTypeMiddleware(s.cfg.MaxRequestBodyBytes())}
 	// globalConcurrencyLimit guards the top of the inference chain; a limit of
 	// 0 (the default) means no limit, so the handler is left out of the chain
 	// entirely rather than wrapping every request in a no-op semaphore.
@@ -442,7 +510,17 @@ func (s *Server) routes() {
 		register("POST "+path, modelChain.Then(dispatch))
 	}
 	for _, path := range modelGetRoutes {
-		register("GET "+path, modelChain.Then(dispatch))
+		h := modelChain.Then(dispatch)
+		switch path {
+		case "/v1/realtime":
+			// Realtime transcription clients name the model in a
+			// session.update event rather than the URL; see realtime_defer.go.
+			h = deferRealtimeModel(inferenceAuthMW, h)
+		case "/props":
+			// autoload=false must not start the model; see props.go.
+			h = modelChain.ThenFunc(s.handleProps)
+		}
+		register("GET "+path, h)
 	}
 
 	// llama-swap API + custom endpoints.
@@ -518,6 +596,8 @@ func (s *Server) routes() {
 	// API group consumed by the administrative UI.
 	register("POST /api/models/unload", http.HandlerFunc(s.handleAPIUnloadAll))
 	register("POST /api/models/unload/{model...}", http.HandlerFunc(s.handleAPIUnloadModel))
+	register("POST /api/models/pause", http.HandlerFunc(s.handleAPIPause))
+	register("POST /api/models/resume", http.HandlerFunc(s.handleAPIResume))
 	register("GET /api/profiles", http.HandlerFunc(s.handleAPIProfiles))
 	register("PUT /api/profiles/active", http.HandlerFunc(s.handleAPIActiveProfile))
 	register("POST /api/inflight/{id}/cancel", http.HandlerFunc(s.handleAPICancelInflight))
@@ -529,7 +609,9 @@ func (s *Server) routes() {
 	register("GET /api/hardware", http.HandlerFunc(s.handleAPIHardware))
 	register("GET /api/residency", http.HandlerFunc(s.handleAPIResidency))
 	register("GET /api/captures/{id}", http.HandlerFunc(s.handleAPICapture))
-	register("/api/mcp", http.HandlerFunc(s.handleAPIMCP))
+	if !s.cfg.HelpAgent.Disable {
+		register("/api/mcp", http.HandlerFunc(s.handleAPIMCP))
+	}
 	register("GET /api/tailcat", http.HandlerFunc(s.handleAPITailcat))
 
 	s.mux = mux
@@ -573,12 +655,21 @@ func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if inference && r.Method != http.MethodOptions {
 		// Normalize first so the model lookup sees the same body format the
-		// model chain will.
-		if bodyErr := prepareModelBody(w, r); bodyErr != nil {
+		// model chain will. A body over the size cap gets a 413 so the client
+		// knows to send less; other body errors look like an unknown model.
+		if bodyErr := prepareModelBody(w, r, s.cfg.MaxRequestBodyBytes()); bodyErr != nil {
+			if bodyErr.status == http.StatusRequestEntityTooLarge {
+				swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+				return
+			}
 			http.NotFound(w, r)
 			return
 		}
 		model, err := swaputil.ExtractModel(r)
+		if bodyErr := bodyTooLargeFrom(err); bodyErr != nil {
+			swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+			return
+		}
 		if err != nil || !tailcatModelAllowed(tc.Models, model) {
 			http.NotFound(w, r)
 			return
@@ -699,5 +790,14 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	}
 
 	wg.Wait()
+
+	// Stop the capture prune goroutine before the caller closes the store.
+	// A request still finishing can store a capture after this; its prune
+	// request is dropped and the next server's pruner catches up.
+	if s.metrics != nil {
+		if err := s.metrics.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }

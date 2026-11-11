@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -39,11 +41,12 @@ var validOutModalities = map[string]struct{}{
 // Used in /v1/models to inform clients. An empty block (all zero values) is
 // treated as not configured.
 type ModelCapConfig struct {
-	In       []string `yaml:"in" json:"in,omitempty"`
-	Out      []string `yaml:"out" json:"out,omitempty"`
-	Tools    bool     `yaml:"tools" json:"tools,omitempty"`
-	Reranker bool     `yaml:"reranker" json:"reranker,omitempty"`
-	Context  int      `yaml:"context" json:"context,omitempty"`
+	In         []string `yaml:"in" json:"in,omitempty"`
+	Out        []string `yaml:"out" json:"out,omitempty"`
+	Tools      bool     `yaml:"tools" json:"tools,omitempty"`
+	Reranker   bool     `yaml:"reranker" json:"reranker,omitempty"`
+	Embeddings bool     `yaml:"embeddings" json:"embeddings,omitempty"`
+	Context    int      `yaml:"context" json:"context,omitempty"`
 
 	// Thinking is advertised to Ollama clients but never gates a request.
 	Thinking bool `yaml:"thinking" json:"thinking,omitempty"`
@@ -63,7 +66,7 @@ type ModelCapConfig struct {
 // DisableAuto is deliberately excluded: a block that only turns discovery off
 // still advertises nothing, so it must render as if it were absent.
 func (c ModelCapConfig) Empty() bool {
-	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && !c.Thinking && c.Context == 0
+	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && !c.Thinking && !c.Embeddings && c.Context == 0
 }
 
 // Merge returns c with every field left at its zero value filled in from
@@ -88,6 +91,9 @@ func (c ModelCapConfig) Merge(auto ModelCapConfig) ModelCapConfig {
 	}
 	if !merged.Reranker {
 		merged.Reranker = auto.Reranker
+	}
+	if !merged.Embeddings {
+		merged.Embeddings = auto.Embeddings
 	}
 	if merged.Context == 0 {
 		merged.Context = auto.Context
@@ -151,6 +157,10 @@ type ModelConfig struct {
 	// KeepResident is a soft auto-router eviction preference. It never prevents
 	// eviction when capacity is needed for another admissible model.
 	KeepResident bool `yaml:"keepResident"`
+	// Capacities declares resource usage for the capacity router. Missing pools
+	// consume zero; higher EvictCost favors keeping this model resident.
+	Capacities map[string]int64 `yaml:"capacities"`
+	EvictCost  int64            `yaml:"evict_cost"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
@@ -195,6 +205,13 @@ type ModelConfig struct {
 	// StallTimeout, so 0 means "no cap" once loaded.
 	MaxTokens int `yaml:"maxTokens"`
 
+	// UnhealthyResponses lists upstream error responses that mean the server
+	// process is broken even though it is still running (for example mlx-lm
+	// answering 404 "generation thread died" forever). When a response matches,
+	// the request fails as the upstream answered it and the process is stopped,
+	// so the next request starts a fresh one. Requests are never retried.
+	UnhealthyResponses []UnhealthyResponse `yaml:"unhealthyResponses"`
+
 	// DisableKeepAlives opens a new upstream connection for every request
 	// instead of reusing pooled ones. Works around upstreams that advertise
 	// keep-alive and then close the connection (#1205).
@@ -215,7 +232,9 @@ type ModelConfig struct {
 	OllamaManaged bool `yaml:"-"`
 }
 
-func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+// UnmarshalYAML applies model defaults and checks capacity values before YAML
+// numeric conversions can truncate fractional requirements or eviction costs.
+func (m *ModelConfig) UnmarshalYAML(node *yaml.Node) error {
 	type rawModelConfig ModelConfig
 	defaults := rawModelConfig{
 		Cmd:              "",
@@ -248,7 +267,18 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		defaults.CmdStop = "taskkill /f /t /pid ${PID}"
 	}
 
-	if err := unmarshal(&defaults); err != nil {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if key == "capacities" {
+			if err := validateCapacityMap(value, "capacities"); err != nil {
+				return err
+			}
+		}
+		if key == "evict_cost" && value.Tag != "!!int" {
+			return fmt.Errorf("evict_cost must be an integer")
+		}
+	}
+	if err := node.Decode(&defaults); err != nil {
 		return err
 	}
 
@@ -293,4 +323,23 @@ func (m *ModelFilters) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // Returns ([]string, error) to match existing API
 func (f ModelFilters) SanitizedStripParams() ([]string, error) {
 	return f.Filters.SanitizedStripParams(), nil
+}
+
+// UnhealthyResponse matches an upstream error response that marks the process
+// as broken. Status is the HTTP status code (400-599). BodyContains, when set,
+// must also appear in the first bytes of the response body; empty matches any
+// body.
+type UnhealthyResponse struct {
+	Status       int    `yaml:"status"`
+	BodyContains string `yaml:"bodyContains"`
+}
+
+// validateUnhealthyResponses rejects rules that could never match an error.
+func validateUnhealthyResponses(rules []UnhealthyResponse) error {
+	for i, rule := range rules {
+		if rule.Status < 400 || rule.Status > 599 {
+			return fmt.Errorf("unhealthyResponses[%d]: status must be 400-599, got %d", i, rule.Status)
+		}
+	}
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -30,17 +31,6 @@ type modelRecord struct {
 	ContextWindow       int            `json:"context_window,omitempty"`
 	Meta                map[string]any `json:"meta,omitempty"`
 	Status              map[string]any `json:"status"`
-}
-
-// cappedMetadataKeys are top-level /v1/models fields produced by the
-// capabilities renderer. If a model's metadata block defines any of these
-// keys, the renderer's values win and the metadata keys are dropped.
-var cappedMetadataKeys = map[string]struct{}{
-	"architecture":         {},
-	"capabilities":         {},
-	"supported_parameters": {},
-	"context_length":       {},
-	"context_window":       {},
 }
 
 // renderCapabilities converts a model's capabilities config into additional
@@ -67,7 +57,7 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 	}
 
 	// Build capabilities map only if there's something to put in it.
-	if hasIn || hasOut || caps.Tools || caps.Reranker {
+	if hasIn || hasOut || caps.Tools || caps.Reranker || caps.Embeddings {
 		capsMap = make(map[string]any)
 	}
 
@@ -75,6 +65,9 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 		if contains(caps.In, "image") {
 			capsMap["vision"] = true
 		}
+	}
+	if hasOut && contains(caps.Out, "decisions") {
+		capsMap["decisions"] = true
 	}
 	if hasIn && hasOut {
 		if contains(caps.In, "audio") && contains(caps.Out, "text") {
@@ -100,6 +93,10 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 		capsMap["reranker"] = true
 	}
 
+	if caps.Embeddings {
+		capsMap["embeddings"] = true
+	}
+
 	if caps.Context > 0 {
 		ctxLen = caps.Context
 	}
@@ -115,23 +112,6 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
-}
-
-// filterCappedMetadata returns metadata with renderer-owned keys removed.
-func filterCappedMetadata(md map[string]any) map[string]any {
-	if len(md) == 0 {
-		return nil
-	}
-	filtered := make(map[string]any, len(md))
-	for k, v := range md {
-		if _, capped := cappedMetadataKeys[k]; !capped {
-			filtered[k] = v
-		}
-	}
-	if len(filtered) == 0 {
-		return nil
-	}
-	return filtered
 }
 
 // handleListModels serves the OpenAI-compatible model listing: local models
@@ -169,9 +149,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		// context_window mirrors context_length for OpenAI-compatible gateways
 		// (e.g. Bifrost) that read the context size from this field name.
 		rec.ContextWindow = rec.ContextLength
-		if !caps.Empty() {
-			metadata = filterCappedMetadata(metadata)
-		}
+		// Custom metadata is nested under meta.llamaswap, so its keys never
+		// collide with the top-level fields rendered from capabilities and is
+		// passed through as configured.
 		llamaSwapMetadata := make(map[string]any, len(metadata)+len(internalMetadata))
 		for key, value := range metadata {
 			llamaSwapMetadata[key] = value
@@ -208,11 +188,19 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		// Resolved once and reused for the aliases, which describe the same
 		// upstream and must not disagree with the model they point at.
 		caps := s.resolveCapabilities(r.Context(), id, mc)
+		upstream := s.localUpstream(r.Context(), id, mc)
+		if upstream != hint.Unknown {
+			internalMetadata["upstream"] = string(upstream)
+		}
 		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, caps, status, internalMetadata))
 
 		if s.cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
 				if alias := strings.TrimSpace(alias); alias != "" {
+					aliasMetadata := map[string]any{"type": "alias", "modelID": id}
+					if upstream != hint.Unknown {
+						aliasMetadata["upstream"] = string(upstream)
+					}
 					data = append(data, newRecord(
 						alias,
 						mc.Name,
@@ -220,7 +208,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 						mc.Metadata,
 						caps,
 						status,
-						map[string]any{"type": "alias", "modelID": id},
+						aliasMetadata,
 					))
 				}
 			}
@@ -383,7 +371,12 @@ func (d *discardResponseWriter) Header() http.Header {
 
 func (d *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-func (d *discardResponseWriter) WriteHeader(status int) { d.status = status }
+func (d *discardResponseWriter) WriteHeader(status int) {
+	if swaputil.IsInformationalStatus(status) {
+		return
+	}
+	d.status = status
+}
 
 // loadLocalModel brings a local model to a ready state by sending it a
 // throwaway GET /. Routing it through the router rather than reaching for the
@@ -426,6 +419,10 @@ func (s *Server) startPreload() {
 		for _, modelID := range models {
 			if !s.local.Handles(modelID) {
 				s.logs.ProxyLogs.Warnf("preload: model %s is not a local model, skipping", modelID)
+				continue
+			}
+			if s.pause.Paused() {
+				s.logs.ProxyLogs.Infof("preload: inference is paused, skipping model %s", modelID)
 				continue
 			}
 			s.logs.ProxyLogs.Infof("preloading model: %s", modelID)
@@ -549,7 +546,7 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case s.local.Handles(modelID):
-		s.local.ServeHTTP(w, r)
+		s.serveLocal(w, r)
 	case s.peer.Handles(modelID):
 		s.peer.ServeHTTP(w, r)
 	default:

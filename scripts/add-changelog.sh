@@ -9,9 +9,14 @@ usage() {
 Usage: scripts/add-changelog.sh [harness] [version]
        scripts/add-changelog.sh [version]
 
-Adds a release version to CHANGELOG.md. The harness is codex, claude,
-opencode or pi and defaults to pi. When version is omitted it is the
-highest v<number> tag plus one.
+Creates changelog/v<version>.md with the release entry. The harness is
+codex, claude, opencode or pi and defaults to pi. When version is
+omitted it is the highest v<number> tag plus one.
+
+Environment:
+  CHANGELOG_MODEL  Model passed to the harness. Defaults to the harness
+         specific model (gpt-6-sol for codex, claude-opus-5-5 for claude,
+         qwen-3.8-next for pi). Ignored by opencode.
 EOF
 }
 
@@ -32,15 +37,17 @@ next_version() {
 }
 
 check_changelog() {
-  local version="$1"
+  local version="$1" file
 
-  if ! git diff --quiet -- CHANGELOG.md; then
-    printf 'CHANGELOG.md has unstaged changes. Commit, stage or stash them first.\n' >&2
+  file="changelog/${version}.md"
+
+  if ! git diff --quiet -- CHANGELOG.md changelog/; then
+    printf 'CHANGELOG.md or changelog/ has unstaged changes. Commit, stage or stash them first.\n' >&2
     exit 1
   fi
 
-  if grep -qE "^## ${version}( |$)" CHANGELOG.md; then
-    printf 'CHANGELOG.md already has an entry for %s.\n' "$version" >&2
+  if [[ -e "$file" ]]; then
+    printf '%s already exists.\n' "$file" >&2
     exit 1
   fi
 }
@@ -48,7 +55,7 @@ check_changelog() {
 changelog_prompt() {
   local version="$1"
 
-  printf '%s\n' "Use docs/changelog-rules.md to add the ${version} release entry to CHANGELOG.md. The release changes are committed: inspect them with git log from the last release tag to HEAD (or main as the rules require). Read each commit's full message and use gh pr view to read each pull request's description and author. Do not use Git reflogs or .git/logs paths. Complete the edit before replying; do not only describe the planned work. Make only the required changelog update."
+  printf '%s\n' "Use docs/changelog-rules.md to create the file changelog/${version}.md containing the ${version} release entry. The release changes are committed: inspect them with git log from the last release tag to HEAD (or main as the rules require). Read each commit's full message and use gh pr view to read each pull request's description and author. Do not use Git reflogs or .git/logs paths. Complete the edit before replying; do not only describe the planned work. Make only the required changelog update."
 }
 
 run_codex() {
@@ -56,7 +63,7 @@ run_codex() {
 
   codex exec \
     --approve-for-me \
-    --model gpt-6-sol \
+    --model "${CHANGELOG_MODEL:-gpt-6-sol}" \
     -c 'model_reasoning_effort="medium"' \
     "$prompt"
 }
@@ -65,7 +72,7 @@ run_claude() {
   local prompt="$1"
 
   claude --print \
-    --model claude-opus-5-5 \
+    --model "${CHANGELOG_MODEL:-claude-opus-5-5}" \
     --permission-mode acceptEdits \
     --allowedTools 'Read' 'Edit' 'Bash(git log:*)' 'Bash(git tag:*)' \
       'Bash(git show:*)' 'Bash(gh pr view:*)' \
@@ -82,7 +89,7 @@ run_pi() {
   local prompt="$1"
 
   pi --print \
-    --model qwen-3.8-next \
+    --model "${CHANGELOG_MODEL:-qwen-3.8-next}" \
     -- "$prompt" </dev/null
 }
 

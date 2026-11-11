@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools/sourcecode"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
@@ -47,12 +47,6 @@ const shutdownTimeout = 30 * time.Second
 // has already asked twice for llama-swap to stop.
 const forceKillTimeout = 2 * time.Second
 
-// docsConfigSchema remains at the repository root because it is also the
-// public schema URL consumed by deployment tooling.
-//
-//go:embed config-schema.json
-var docsConfigSchema []byte
-
 // logTimeFormats maps the cfg.LogTimeFormat value to a Go time layout. An
 // unset or unrecognised value yields "" — no timestamp prefix.
 var logTimeFormats = map[string]string{
@@ -73,11 +67,25 @@ var logTimeFormats = map[string]string{
 	"stampnano":   time.StampNano,
 }
 
-func configStorePath(cfg config.Config) string {
+// storePaths are the database files a store is opened with. An empty path
+// is an in-memory database. A reload reopens the store only when they change.
+type storePaths struct {
+	activity string
+	captures string
+}
+
+func configStorePaths(cfg config.Config) storePaths {
 	if cfg.Store == nil {
-		return ""
+		return storePaths{}
 	}
-	return strings.TrimSpace(cfg.Store.Path)
+	return storePaths{
+		activity: strings.TrimSpace(cfg.Store.Path),
+		captures: cfg.Store.CapturesPath(),
+	}
+}
+
+func openStore(paths storePaths) (*sqlite.Store, error) {
+	return sqlite.New(paths.activity, paths.captures)
 }
 
 func configureTailcatListener(cfg *config.Config, keyPath string) error {
@@ -240,16 +248,31 @@ func main() {
 	}
 
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
-	referenceDocs := docagent.NewWithSchema(docs.Files, docsConfigSchema)
 
-	initialStorePath := configStorePath(cfg)
-	initialStore, err := sqlite.New(initialStorePath)
+	// Indexed once and shared by every Server instance, including the ones a
+	// hot config reload creates: the documentation is immutable and does not
+	// depend on cfg.
+	referenceDocs := docagent.NewWithSchema(docs.Files, docs.ConfigSchema)
+
+	// Shared the same way. The source behind the code__* MCP tools is
+	// embedded only in builds with the embed_src tag.
+	sourceCode := sourcecode.NewProvider(sourcecode.Options{
+		Source: sourcecode.Embedded,
+		Ref:    sourcecode.RefForVersion(version),
+	})
+
+	// Shared the same way, so a config reload while inference is paused
+	// keeps it paused (issue #1268).
+	pauseState := server.NewPauseState()
+
+	initialStorePaths := configStorePaths(cfg)
+	initialStore, err := openStore(initialStorePaths)
 	if err != nil {
 		slog.Error("failed to create store", "error", err)
 		os.Exit(1)
 	}
 
-	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs)
+	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		initialStore.Close()
@@ -260,7 +283,7 @@ func main() {
 	var activeMu sync.RWMutex
 	activeSrv := initialSrv
 	activeStore := initialStore
-	activeStorePath := initialStorePath
+	activeStorePaths := initialStorePaths
 
 	tailcatHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		activeMu.RLock()
@@ -340,24 +363,24 @@ func main() {
 			return
 		}
 
-		newStorePath := configStorePath(newCfg)
+		newStorePaths := configStorePaths(newCfg)
 		activeMu.RLock()
 		currentStore := activeStore
-		currentStorePath := activeStorePath
+		currentStorePaths := activeStorePaths
 		currentTailcat := activeTailcat
 		activeMu.RUnlock()
 
 		newStore := currentStore
-		storeChanged := newStorePath != currentStorePath
+		storeChanged := newStorePaths != currentStorePaths
 		if storeChanged {
-			newStore, err = sqlite.New(newStorePath)
+			newStore, err = openStore(newStorePaths)
 			if err != nil {
 				proxyLog.Warnf("failed to create new store during reload: %v", err)
 				return
 			}
 		}
 
-		newSrv, err := server.New(newCfg, logs, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs)
+		newSrv, err := server.New(newCfg, logs, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			if storeChanged {
@@ -379,7 +402,7 @@ func main() {
 		oldStore := activeStore
 		activeSrv = newSrv
 		activeStore = newStore
-		activeStorePath = newStorePath
+		activeStorePaths = newStorePaths
 		activeMu.Unlock()
 
 		applyLogSettings(newCfg)

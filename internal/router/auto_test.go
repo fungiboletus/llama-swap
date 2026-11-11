@@ -33,7 +33,7 @@ func autoConfig(models map[string]config.ModelConfig, capacity uint64) config.Co
 
 func newTestAuto(t *testing.T, conf config.Config, processes map[string]process.Process) (*Auto, *autoSwapper) {
 	t.Helper()
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	swapper, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -57,7 +57,7 @@ func TestAutoSwapper_FitAndDeterministicEviction(t *testing.T) {
 		"b": {Memory: 4},
 		"c": {Memory: 5},
 	}, 11)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -74,7 +74,7 @@ func TestAutoSwapper_PrefersLongerIdleAndCheaperLoad(t *testing.T) {
 		"busy": {Memory: 5},
 		"next": {Memory: 6},
 	}, 11)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -93,7 +93,7 @@ func TestAutoSwapper_PrefersOrdinaryModelsOverKeepResidentModels(t *testing.T) {
 		"ordinary":  {Memory: 5},
 		"next":      {Memory: 6},
 	}, 11)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -111,7 +111,7 @@ func TestAutoSwapper_EvictsKeepResidentModelWhenCapacityRequiresIt(t *testing.T)
 		"preferred": {Memory: 5, KeepResident: true},
 		"next":      {Memory: 6},
 	}, 10)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -125,7 +125,7 @@ func TestAutoSwapper_LogsPreferredEviction(t *testing.T) {
 		"preferred": {Memory: 5, KeepResident: true},
 		"next":      {Memory: 6},
 	}, 10)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	var logs bytes.Buffer
@@ -138,7 +138,7 @@ func TestAutoSwapper_LogsPreferredEviction(t *testing.T) {
 
 func TestAutoSwapper_ProcessTreeObservationPersistsHighWater(t *testing.T) {
 	conf := autoConfig(map[string]config.ModelConfig{"model": {}}, 100)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -157,7 +157,7 @@ func TestAutoSwapper_ProcessTreeObservationPersistsHighWater(t *testing.T) {
 
 func TestAutoSwapper_ProcessTreeObservationsRemainPerModel(t *testing.T) {
 	conf := autoConfig(map[string]config.ModelConfig{"a": {}, "b": {}}, 100)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -173,7 +173,7 @@ func TestAutoSwapper_ProcessTreeObservationsRemainPerModel(t *testing.T) {
 
 func TestAutoSwapper_PersistedProfilesPreserveConcurrencyAfterRestart(t *testing.T) {
 	conf := autoConfig(map[string]config.ModelConfig{"a": {}, "b": {}}, 100)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	first, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -193,7 +193,7 @@ func TestAutoSwapper_ExplicitDS4ReservationsRemainMutuallyExclusive(t *testing.T
 		"glm-5.3-flash":     {Memory: config.ByteSize(190 * gib)},
 		"ordinary":          {Memory: config.ByteSize(16 * gib)},
 	}, 208*gib)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(conf, logmon.NewWriter(io.Discard), st)
@@ -321,7 +321,7 @@ func BenchmarkAutoSwapper_EvictionFor500Models(b *testing.B) {
 	}
 	models["target"] = config.ModelConfig{Memory: 2}
 	conf := autoConfig(models, 500)
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestAutoSwapper_500ModelsRegressionGuard(t *testing.T) {
 		running = append(running, id)
 	}
 	models["target"] = config.ModelConfig{Memory: 2}
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	require.NoError(t, err)
 	defer st.Close()
 	p, err := newAutoSwapper(autoConfig(models, 500), logmon.NewWriter(io.Discard), st)

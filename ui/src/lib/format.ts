@@ -21,6 +21,24 @@ export function formatSpeed(speed: number): string {
   return speed < 0 ? "unknown" : speed.toFixed(2) + " t/s";
 }
 
+/**
+ * Format a row's decode rate. When the upstream reported none (negative), fall
+ * back to output tokens over the whole request duration and mark it with "~":
+ * that includes prompt processing and model load, so it is a lower bound.
+ * Rows with too little to estimate from stay "unknown".
+ */
+export function formatDecodeSpeed(row: {
+  duration_ms: number;
+  tokens: { tokens_per_second: number; output_tokens: number };
+}): string {
+  const { tokens_per_second, output_tokens } = row.tokens;
+  if (tokens_per_second >= 0) return formatSpeed(tokens_per_second);
+  if (output_tokens > 1 && row.duration_ms > 0) {
+    return "~" + formatSpeed(output_tokens / (row.duration_ms / 1000));
+  }
+  return formatSpeed(tokens_per_second);
+}
+
 /** Format a byte count as B / KB / MB. */
 export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + " B";

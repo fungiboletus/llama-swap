@@ -11,7 +11,7 @@ import (
 
 func TestStore_InsertListAndFilterActivity(t *testing.T) {
 	ctx := context.Background()
-	st, err := New("")
+	st, err := New("", "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestStore_InsertListAndFilterActivity(t *testing.T) {
 func seedFilterActivity(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 	ctx := context.Background()
-	st, err := New("")
+	st, err := New("", "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestStore_ListActivityFilterCombinedPaging(t *testing.T) {
 
 func TestStore_ListActivitySort(t *testing.T) {
 	ctx := context.Background()
-	st, err := New("")
+	st, err := New("", "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestStore_ListActivitySort(t *testing.T) {
 
 func TestStore_ActivityStats(t *testing.T) {
 	ctx := context.Background()
-	st, err := New("")
+	st, err := New("", "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestStore_ActivityStats(t *testing.T) {
 
 func TestStore_PruneActivity(t *testing.T) {
 	ctx := context.Background()
-	st, err := New("")
+	st, err := New("", "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestStore_NewFilePersistsActivity(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "llama-swap.sqlite")
 
-	st, err := New(path)
+	st, err := New(path, "")
 	if err != nil {
 		t.Fatalf("New file store: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestStore_NewFilePersistsActivity(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	st, err = New(path)
+	st, err = New(path, "")
 	if err != nil {
 		t.Fatalf("reopen file store: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestStore_NewFilePersistsActivity(t *testing.T) {
 
 func TestStore_NewFileUsesWAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llama-swap.sqlite")
-	st, err := New(path)
+	st, err := New(path, "")
 	if err != nil {
 		t.Fatalf("New file store: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestStore_NewFileUsesWAL(t *testing.T) {
 
 func TestStore_MemoryProfilePersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llama-swap.db")
-	st, err := New(path)
+	st, err := New(path, "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestStore_MemoryProfilePersists(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	st, err = New(path)
+	st, err = New(path, "")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestStore_MemoryProfilePersists(t *testing.T) {
 
 func TestStore_ForkSchemaUpgradePreservesActivity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fork.db")
-	st, err := New(path)
+	st, err := New(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,16 +489,27 @@ func TestStore_ForkSchemaUpgradePreservesActivity(t *testing.T) {
 	if err := st.MemoryProfiles().Save(ctx, store.MemoryProfile{ModelID: "m", Fingerprint: "f", ObservedBytes: 42}); err != nil {
 		t.Fatal(err)
 	}
-	// The deployed fork was at Goose version 4 without upstream's cache table.
-	if _, err := st.db.Exec(`DROP TABLE cache`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.Exec(`DELETE FROM goose_db_version WHERE version_id = 5`); err != nil {
-		t.Fatal(err)
+	// The deployed fork recorded Goose versions 4 (memory profiles) and 5
+	// (cache) before upstream used those numbers for the task/route and
+	// capture_id columns, so its database has neither those columns nor the
+	// fork migrations at their current 00100+ numbers.
+	for _, statement := range []string{
+		`DROP TABLE cache`,
+		`ALTER TABLE activity DROP COLUMN task`,
+		`ALTER TABLE activity DROP COLUMN route`,
+		`ALTER TABLE activity DROP COLUMN peer_id`,
+		`ALTER TABLE activity DROP COLUMN reasoning_tokens`,
+		`ALTER TABLE activity DROP COLUMN capture_id`,
+		`DELETE FROM goose_db_version WHERE version_id >= 4`,
+		`INSERT INTO goose_db_version (version_id, is_applied) VALUES (4, 1), (5, 1)`,
+	} {
+		if _, err := st.db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
 	}
 	st.Close()
 
-	st, err = New(path)
+	st, err = New(path, "")
 	if err != nil {
 		t.Fatalf("upgrade fork database: %v", err)
 	}
@@ -514,17 +525,21 @@ func TestStore_ForkSchemaUpgradePreservesActivity(t *testing.T) {
 	if _, err := st.db.Exec(`SELECT key FROM cache LIMIT 1`); err != nil {
 		t.Fatalf("cache migration: %v", err)
 	}
+	if _, err := st.Activity().Insert(ctx, store.ActivityLogEntry{Model: "m", Task: "chat", CaptureID: "c"}); err != nil {
+		t.Fatalf("upstream columns were not added: %v", err)
+	}
 }
 
 func TestStore_UpstreamSchemaUpgradeAddsForkData(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upstream.db")
-	st, err := New(path)
+	st, err := New(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Upstream's version 3 has source and cache, but no fork fields.
+	// An upstream database has upstream's versions 1-5 and none of the fork
+	// fields.
 	for _, statement := range []string{
-		`DELETE FROM goose_db_version WHERE version_id IN (4, 5)`,
+		`DELETE FROM goose_db_version WHERE version_id >= 100`,
 		`DROP TABLE memory_profiles`,
 		`ALTER TABLE activity DROP COLUMN authenticated_user`,
 	} {
@@ -534,7 +549,7 @@ func TestStore_UpstreamSchemaUpgradeAddsForkData(t *testing.T) {
 	}
 	st.Close()
 
-	st, err = New(path)
+	st, err = New(path, "")
 	if err != nil {
 		t.Fatalf("upgrade upstream database: %v", err)
 	}
